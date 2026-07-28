@@ -17,13 +17,23 @@ import {
   AVC_MAX_PIXELS,
   VIDEO_DIM_HARD_CAP,
   computeAvcCappedDimensions,
+  computeEffectiveQueueCap,
+  computeStartupQueueCap,
+  computeSteadyQueueCap,
   isAacRateInSpec,
   isReclaimErrorMessage,
   shouldFailZeroChunksAtStop,
   shouldResetReclaimCounter,
   shouldThrottleReclaimRebuild,
   shouldTriggerSleepRecovery,
+  STARTUP_CAUGHT_UP_QUEUE,
+  STARTUP_CAUGHT_UP_RUN,
+  STARTUP_HARD_FRAME_LIMIT,
+  STARTUP_HARD_MS,
+  STARTUP_QUEUE_CAP,
 } from "./recorderLogic";
+import { getStartupFlags } from "./startupFlags";
+import { claimPrewarmedEncoder } from "../encoderPrewarm";
 // Lazy-load Mp4MuxerWrapper so its ~3MB mediabunny static import doesn't
 // drag into recorder.bundle.js cold start (dominates click-record latency).
 let _mp4MuxerWrapperPromise = null;
@@ -167,9 +177,56 @@ export class WebCodecsRecorder {
     // Backpressure: feeding faster than the encoder drains grows the
     // queue unbounded and chunks stop emitting (28-byte failure).
     // Past threshold, drop the next frame and force a keyframe.
+    //
+    // 16, not 4: a ~170ms hiccup walks the queue 0->4 in ~5 frames and the
+    // drop lands before encode(), costing 2-4 frames mid-recording. 12 still
+    // dropped occasionally; 24 was no better and twice the memory.
+    // start() lowers it per-resolution: ~130MB at 1080p, ~530MB at 4K.
+    this._encoderMaxQueueSizeExplicit =
+      Number.isFinite(options.encoderMaxQueueSize) ||
+      Number.isFinite(
+        /** @type {any} */ (globalThis).__screenityEncoderMaxQueueSizeForTests,
+      );
     this._encoderMaxQueueSize = Number.isFinite(options.encoderMaxQueueSize)
       ? options.encoderMaxQueueSize
-      : 4;
+      : Number.isFinite(
+            /** @type {any} */ (globalThis)
+              .__screenityEncoderMaxQueueSizeForTests,
+          )
+        ? /** @type {any} */ (globalThis)
+            .__screenityEncoderMaxQueueSizeForTests
+        : 16;
+    // Cold-start grace: a fresh HW encoder spikes the queue for under a second
+    // while its session comes up. Buffer that, then latch back to the steady cap.
+    this._startupMaxQueueSize = Number.isFinite(options.startupMaxQueueSize)
+      ? options.startupMaxQueueSize
+      : STARTUP_QUEUE_CAP;
+    this._startupWindowClosed = false;
+    this._startupCaughtUpRun = 0;
+    this._startupFirstFrameAt = null;
+    this._startupFramesSeen = 0;
+    this._startupBufferEngaged = false;
+    this._framesBufferedAtStart = 0;
+    // How long the elastic cap stays available. Overridable without a rebuild,
+    // same pattern as the watchdog test knobs above.
+    this._startupHardMs = Number.isFinite(options.startupHardMs)
+      ? options.startupHardMs
+      : Number.isFinite(
+            /** @type {any} */ (globalThis).__screenityStartupWindowMsForTests,
+          )
+        ? /** @type {any} */ (globalThis).__screenityStartupWindowMsForTests
+        : STARTUP_HARD_MS;
+    this._startupHardFrameLimit = Number.isFinite(options.startupHardFrameLimit)
+      ? options.startupHardFrameLimit
+      : Number.isFinite(
+            /** @type {any} */ (globalThis)
+              .__screenityStartupWindowFramesForTests,
+          )
+        ? /** @type {any} */ (globalThis)
+            .__screenityStartupWindowFramesForTests
+        : STARTUP_HARD_FRAME_LIMIT;
+    this._adoptedPrewarmEncoder = false;
+    this._adoptedDecoderConfig = null;
     this._forceNextKeyframe = false;
     this._droppedForBackpressureCount = 0;
     // Audio: same pattern, deeper queue. Frames are smaller / more
@@ -281,6 +338,9 @@ export class WebCodecsRecorder {
     // Black placeholder frames synthesized before the first real frame to
     // bridge macOS static-screen first-frame starvation (see readVideoLoop).
     this._syntheticFirstFrameCount = 0;
+    // In-flight reads, hoisted so a fallback timeout cannot orphan them.
+    this._pendingVideoRead = null;
+    this._pendingAudioRead = null;
     this._firstChunkAt = null;
     this._encoderConstructCount = 0;
     this._videoEncoderStateAtStop = null;
@@ -368,6 +428,19 @@ export class WebCodecsRecorder {
     this._lastChunkAt = null;
     this._lastFailureCode = null;
     this._forceNextKeyframe = false;
+    this._startupWindowClosed = false;
+    this._startupCaughtUpRun = 0;
+    this._startupFirstFrameAt = null;
+    this._startupFramesSeen = 0;
+    this._startupBufferEngaged = false;
+    this._framesBufferedAtStart = 0;
+    this._adoptedPrewarmEncoder = false;
+    this._adoptedDecoderConfig = null;
+    // A read hoisted by the previous recording is bound to a cancelled reader:
+    // left set, the next readVideoLoop resolves {done:true} on its first
+    // iteration and records nothing.
+    this._pendingVideoRead = null;
+    this._pendingAudioRead = null;
     this._droppedForBackpressureCount = 0;
     this._droppedAudioForBackpressureCount = 0;
     this._peakVideoEncodeQueueSize = 0;
@@ -471,6 +544,23 @@ export class WebCodecsRecorder {
         this.targetHeight = dimResult.height;
 
         this.log("[WCR] Target:", this.targetWidth, "x", this.targetHeight);
+
+        // Now that dims are known, bound the steady cap by bytes: 16 frames is
+        // ~130MB at 1080p but ~530MB at 4K, and this one never reverts. 1080p
+        // keeps the measured 16, 4K falls back toward the historical 4.
+        if (!this._encoderMaxQueueSizeExplicit) {
+          this._encoderMaxQueueSize = computeSteadyQueueCap({
+            width: this.targetWidth,
+            height: this.targetHeight,
+          });
+        }
+        if (!Number.isFinite(this.options.startupMaxQueueSize)) {
+          this._startupMaxQueueSize = computeStartupQueueCap({
+            width: this.targetWidth,
+            height: this.targetHeight,
+            steadyCap: this._encoderMaxQueueSize,
+          });
+        }
 
         const fps = this.options.fps || 30;
         this._frameDurationUs = Math.round(1_000_000 / fps);
@@ -949,6 +1039,9 @@ export class WebCodecsRecorder {
         firstChunkSeen: this._firstChunkSeen,
         framesFromMSTP: this._framesFromMSTP,
         syntheticFirstFrameCount: this._syntheticFirstFrameCount,
+        // Last-frame repeats from the static-frame fallback. High here against
+        // a near-zero framesFromMSTP means a frozen recording.
+        staticFrameSyntheticCount: this._staticFrameSyntheticCount,
         muxerBytes: muxerStats?.totalEmittedBytes ?? null,
         muxerEmits: muxerStats?.emitCount ?? null,
         muxerFinalizeOk,
@@ -979,6 +1072,11 @@ export class WebCodecsRecorder {
           peakEncodeQueueSize: {
             video: this._peakVideoEncodeQueueSize,
             audio: this._peakAudioEncodeQueueSize,
+          },
+          startupBuffer: {
+            engaged: this._startupBufferEngaged,
+            framesBuffered: this._framesBufferedAtStart,
+            adoptedWarmEncoder: this._adoptedPrewarmEncoder === true,
           },
           flushMs: {
             video: this._videoFlushMs ?? null,
@@ -1042,8 +1140,29 @@ export class WebCodecsRecorder {
     this._stopping = false;
   }
 
-  // Read-only snapshot of the diagnostic counters and encoder choice.
-  // Safe to call mid-recording and at stop; never throws.
+  // Readable at any time: stop() early-returns once the recorder isn't
+  // running, so onFinalized is missing on exactly the sessions worth
+  // explaining (zero-frame exit, spent stall budget, failed start).
+  getEncodeStats() {
+    return {
+      peakEncodeQueueVideo: this._peakVideoEncodeQueueSize ?? null,
+      peakEncodeQueueAudio: this._peakAudioEncodeQueueSize ?? null,
+      droppedForBackpressureVideo: this._droppedForBackpressureCount ?? null,
+      droppedForBackpressureAudio:
+        this._droppedAudioForBackpressureCount ?? null,
+      // Submissions to encode(), not muxer output (that's chunksOut).
+      framesEncoded: this.frameCount ?? null,
+      chunksOut: this._chunksOut ?? null,
+      steadyQueueCap: this._encoderMaxQueueSize ?? null,
+      // Drops inside the startup window were judged against this, not the
+      // steady cap; without it droppedForBackpressureVideo can't be read.
+      startupQueueCap: this._startupMaxQueueSize ?? null,
+      startupBufferEngaged: this._startupBufferEngaged ?? null,
+      framesBufferedAtStart: this._framesBufferedAtStart ?? null,
+      adoptedWarmEncoder: this._adoptedPrewarmEncoder === true,
+    };
+  }
+
   getDiagSnapshot() {
     let firstChunkLatencyMs = null;
     if (this._firstChunkAt != null && this._videoStartUs != null) {
@@ -1093,6 +1212,23 @@ export class WebCodecsRecorder {
     this.paused = true;
     this.pauseStartUs = performance.now() * 1000;
 
+    // Drop in-flight reads: the loop short-circuits while paused, so one
+    // pending from before would deliver a stale frame on resume.
+    const staleVideoRead = this._pendingVideoRead;
+    const staleAudioRead = this._pendingAudioRead;
+    this._pendingVideoRead = null;
+    this._pendingAudioRead = null;
+    for (const stale of [staleVideoRead, staleAudioRead]) {
+      if (!stale) continue;
+      stale
+        .then((r) => {
+          try {
+            r?.value?.close?.();
+          } catch {}
+        })
+        .catch(() => {});
+    }
+
     // Release the HW slot up front so long pauses don't burn the
     // reclaim cap. Chrome reclaims at ~60s, w3c/webcodecs#363.
     this._encodersClosedForPause = true;
@@ -1124,6 +1260,16 @@ export class WebCodecsRecorder {
       }
       // Force a keyframe so the decoder doesn't reference pre-pause frames.
       this._forceNextKeyframe = true;
+      // The rebuilt encoder is cold and ramps like it did at start, so reopen
+      // the grace window. Floored on pause length: without it, a user tapping
+      // pause/resume holds the startup cap (and its memory) all session.
+      const pausedMs = (nowUs - this.pauseStartUs) / 1000;
+      if (pausedMs >= 1000) {
+        this._startupWindowClosed = false;
+        this._startupCaughtUpRun = 0;
+        this._startupFirstFrameAt = null;
+        this._startupFramesSeen = 0;
+      }
     }
 
     this.paused = false;
@@ -1158,6 +1304,27 @@ export class WebCodecsRecorder {
       cancelWithTimeout(this.videoReader),
       cancelWithTimeout(this.audioReader),
     ]);
+
+    // cancel() settles any hoisted read; close the frame it yields so the last
+    // one isn't leaked.
+    const drainPendingRead = async (pending) => {
+      if (!pending) return;
+      try {
+        const r = await Promise.race([
+          pending,
+          new Promise((resolve) => setTimeout(() => resolve(null), 500)),
+        ]);
+        try {
+          r?.value?.close?.();
+        } catch {}
+      } catch {}
+    };
+    await Promise.all([
+      drainPendingRead(this._pendingVideoRead),
+      drainPendingRead(this._pendingAudioRead),
+    ]);
+    this._pendingVideoRead = null;
+    this._pendingAudioRead = null;
 
     try {
       this.videoEncoder?.close();
@@ -1242,6 +1409,11 @@ export class WebCodecsRecorder {
         peakEncodeQueueSize: {
           video: this._peakVideoEncodeQueueSize,
           audio: this._peakAudioEncodeQueueSize,
+        },
+        startupBuffer: {
+          engaged: this._startupBufferEngaged,
+          framesBuffered: this._framesBufferedAtStart,
+          adoptedWarmEncoder: this._adoptedPrewarmEncoder === true,
         },
         flushMs: {
           video: this._videoFlushMs ?? null,
@@ -1556,6 +1728,13 @@ export class WebCodecsRecorder {
     // Extract output/error callbacks so the prefer-software retry below
     // can rebuild the VideoEncoder with the same handlers.
     const videoEncoderOutput = (chunk, meta) => {
+        // An adopted encoder already emitted its decoderConfig to the prewarm's
+        // discard sink, and Chrome only re-emits when the reported config
+        // changes. Without a replay of the one captured at warmup the muxer
+        // throws ("must include a decoder configuration") on a header-only file.
+        if (!meta?.decoderConfig && this._adoptedDecoderConfig) {
+          meta = { ...(meta || {}), decoderConfig: this._adoptedDecoderConfig };
+        }
         // E2E hook: drop the first N chunks to drive the no-first-chunk
         // watchdog in tests.
         const _g = /** @type {any} */ (globalThis);
@@ -1723,6 +1902,49 @@ export class WebCodecsRecorder {
           : [],
       });
     }
+    // Adopt-or-create: a prewarmed encoder has already paid the session ramp
+    // that costs the opening frames, so take it over instead of opening a cold
+    // one. A claim that can't hand it over disposes it, freeing the HW slot.
+    let adopted = null;
+    try {
+      // Adoption skips the configure() path below, so tests forcing a
+      // configure failure there need a fresh encoder.
+      const gHooks = /** @type {any} */ (globalThis);
+      const forcedConfigureTest =
+        gHooks.__screenityForceConfigureHwQuotaError === true ||
+        gHooks.__screenityForceConfigureSwQuotaError === true;
+      // Guarded like _rebuildVideoEncoder's replacement: once this encoder
+      // isn't the active one (rebuild, pause, stop) its late errors must not
+      // burn the reclaim budget or fail a healthy recording.
+      const adoptedErrorHandler = (err) => {
+        if (this.videoEncoder !== adopted?.encoder) return;
+        videoEncoderError(err);
+      };
+      adopted = claimPrewarmedEncoder(config, videoEncoderOutput, adoptedErrorHandler, {
+        allowAdopt: this.options.allowPrewarmAdopt !== false && !forcedConfigureTest,
+        preferSoftware: this.options.preferSoftware === true,
+      });
+    } catch (adoptErr) {
+      this.warn("[WCR] prewarm adopt threw; using a fresh encoder", adoptErr);
+      adopted = null;
+    }
+    if (adopted?.encoder) {
+      this.videoEncoder = adopted.encoder;
+      this._adoptedPrewarmEncoder = true;
+      this._adoptedDecoderConfig = adopted.decoderConfigFallback || null;
+      this._activeVideoConfig = config;
+      // configure() always runs at adoption; the flag says whether the config
+      // differed, not whether a reconfigure happened.
+      this.log("[WCR] adopted prewarmed VideoEncoder", {
+        configChanged: adopted.reconfigured,
+        codec: codecLabel,
+      });
+      perfMark("WCR.videoEncoder.adopted", {
+        configChanged: adopted.reconfigured,
+      });
+      return;
+    }
+
     this.videoEncoder = new VideoEncoder({
       output: videoEncoderOutput,
       error: videoEncoderError,
@@ -2511,17 +2733,25 @@ export class WebCodecsRecorder {
         // emitting and the stall watchdog would misfire. Reuse the
         // last canvas on timeout to keep chunks flowing.
         const STATIC_FRAME_FALLBACK_MS = 1500;
-        const readResult = await Promise.race([
-          this.videoReader
+        // Hoisted, not re-issued per iteration. A read that loses the race
+        // isn't cancelled: it stays queued and later eats a frame nobody
+        // encodes or closes, so on a static screen every timeout costs the
+        // next real frame.
+        if (!this._pendingVideoRead) {
+          this._pendingVideoRead = this.videoReader
             .read()
             .then((v) => ({ ...v, isSyntheticTimeout: false }))
             .catch(() => ({
               done: true,
               value: null,
               isSyntheticTimeout: false,
-            })),
-          new Promise((resolve) =>
-            setTimeout(
+            }));
+        }
+        let fallbackTimer = null;
+        const readResult = await Promise.race([
+          this._pendingVideoRead,
+          new Promise((resolve) => {
+            fallbackTimer = setTimeout(
               () =>
                 resolve({
                   done: false,
@@ -2529,9 +2759,14 @@ export class WebCodecsRecorder {
                   isSyntheticTimeout: true,
                 }),
               STATIC_FRAME_FALLBACK_MS,
-            ),
-          ),
+            );
+          }),
         ]);
+        if (!readResult.isSyntheticTimeout) {
+          // Consumed: clear before any early continue below.
+          this._pendingVideoRead = null;
+          if (fallbackTimer) clearTimeout(fallbackTimer);
+        }
 
         let isSynthetic = false;
         let frame = null;
@@ -2640,10 +2875,49 @@ export class WebCodecsRecorder {
             this._peakVideoEncodeQueueSize = vQueueSize;
           }
 
+          // Startup grace window: while the encoder ramps, buffer instead of
+          // dropping. Frames carry wall-clock PTS, so they encode late but the
+          // file stays complete. Latches to the steady cap once it closes.
+          let effectiveQueueCap = this._encoderMaxQueueSize;
+          if (!this._startupWindowClosed) {
+            if (this._startupFirstFrameAt === null) {
+              this._startupFirstFrameAt = performance.now();
+            }
+            this._startupFramesSeen += 1;
+            if (vQueueSize <= STARTUP_CAUGHT_UP_QUEUE) {
+              this._startupCaughtUpRun += 1;
+            } else {
+              this._startupCaughtUpRun = 0;
+            }
+            effectiveQueueCap = computeEffectiveQueueCap({
+              framesSinceStart: this._startupFramesSeen,
+              elapsedMs: performance.now() - this._startupFirstFrameAt,
+              caughtUp: this._startupCaughtUpRun >= STARTUP_CAUGHT_UP_RUN,
+              steadyCap: this._encoderMaxQueueSize,
+              startupCap: this._startupMaxQueueSize,
+              hardFrameLimit: this._startupHardFrameLimit,
+              hardMs: this._startupHardMs,
+              disabled: getStartupFlags().startupBufferDisabled,
+            });
+            if (effectiveQueueCap <= this._encoderMaxQueueSize) {
+              this._startupWindowClosed = true;
+              effectiveQueueCap = this._encoderMaxQueueSize;
+            } else if (
+              vQueueSize > this._encoderMaxQueueSize &&
+              vQueueSize <= effectiveQueueCap
+            ) {
+              // Counts only frames the wider cap actually saves (above the
+              // steady cap, still inside the grace cap). Counting ones that
+              // drop anyway would overstate the fix in telemetry.
+              this._startupBufferEngaged = true;
+              this._framesBufferedAtStart += 1;
+            }
+          }
+
           // Backpressure: drop the frame and force a keyframe next so
           // the stream stays decodable. An unbounded queue can stop
           // emitting chunks entirely.
-          if (vQueueSize > this._encoderMaxQueueSize) {
+          if (vQueueSize > effectiveQueueCap) {
             this._droppedForBackpressureCount += 1;
             this._forceNextKeyframe = true;
             this._videoFrameIndex = i + 1;
@@ -2706,8 +2980,10 @@ export class WebCodecsRecorder {
               // the reclaim case to a rebuild, not a drop into a dead encoder.
               if (encErr?.name === "QuotaExceededError") {
                 const q = this.videoEncoder?.encodeQueueSize ?? 0;
-                // Well below the ~30 backpressure cap.
-                if (q <= 5) {
+                // A near-empty queue only meant reclaim while the cap was 4;
+                // at 16 a real reclaim looks like backpressure and silently
+                // skips the rebuild. Chrome names reclaims in the message.
+                if (isReclaimErrorMessage(encErr) || q <= 5) {
                   this._videoFrameIndex = i + 1;
                   this._forceNextKeyframe = true;
                   this.warn(
@@ -2973,18 +3249,28 @@ export class WebCodecsRecorder {
 
     try {
       while (this.running) {
-        const readResult = await Promise.race([
-          this.audioReader
+        // Hoisted for the same reason as the video read: a losing read
+        // isn't cancelled and would eat the next packet.
+        if (!this._pendingAudioRead) {
+          this._pendingAudioRead = this.audioReader
             .read()
             .then((v) => ({ ...v, timedOut: false }))
-            .catch(() => ({ done: true, timedOut: false })),
-          new Promise((r) =>
-            setTimeout(
+            .catch(() => ({ done: true, timedOut: false }));
+        }
+        let audioFallbackTimer = null;
+        const readResult = await Promise.race([
+          this._pendingAudioRead,
+          new Promise((r) => {
+            audioFallbackTimer = setTimeout(
               () => r({ value: null, done: false, timedOut: true }),
               SILENCE_TIMEOUT_MS,
-            ),
-          ),
+            );
+          }),
         ]);
+        if (!readResult.timedOut) {
+          this._pendingAudioRead = null;
+          if (audioFallbackTimer) clearTimeout(audioFallbackTimer);
+        }
 
         if (readResult.timedOut) {
           const trackEnded =

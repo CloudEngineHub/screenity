@@ -16,6 +16,11 @@ import {
 } from "../Recorder/webcodecs/WebCodecsRecorder";
 import { startPrewarm, stopPrewarm } from "../Recorder/streamWarmup";
 import {
+  startEncoderPrewarm,
+  closeActiveEncoderPrewarm,
+} from "../Recorder/encoderPrewarm";
+import { isWarmAdoptEnabled } from "../Recorder/webcodecs/startupFlags";
+import {
   debugRecordingEvent,
   resetRecordingDebugSession,
   isRecordingDebugEnabled,
@@ -1440,6 +1445,10 @@ const Recorder = () => {
         recdbgTotalBytes = 0;
         mediaRecorderStartAt = Date.now();
 
+        // MediaRecorder never adopts the warm encoder; release the HW slot
+        // rather than leaving it to the unclaimed-prewarm timeout.
+        closeActiveEncoderPrewarm().catch(() => {});
+
         recorder.current = new MediaRecorder(liveStream.current, {
           mimeType: mimeType,
           audioBitsPerSecond: audioBitsPerSecond,
@@ -2418,6 +2427,35 @@ const Recorder = () => {
           const endCropTo = perfSpan("Region.Recorder cropTo");
           await track.cropTo(target.current);
           endCropTo();
+
+          // Warm a real encoder for the recorder to adopt; cropTo is the only
+          // dead time region gets. Gated on adoption unlike the other call
+          // sites: region has no countdown, so its start path is the most
+          // latency-sensitive and this block costs a storage read.
+          try {
+            if (!isWarmAdoptEnabled()) throw new Error("warm-adopt-disabled");
+            const cropSettings = track.getSettings?.() || {};
+            const rawW = Number(cropSettings.width) || width || 0;
+            const rawH = Number(cropSettings.height) || height || 0;
+            if (rawW > 0 && rawH > 0) {
+              // Same tier fit the recorder encodes at.
+              const fit = Math.min(width / rawW, height / rawH, 1);
+              const warmW = Math.max(2, Math.round((rawW * fit) / 2) * 2);
+              const warmH = Math.max(2, Math.round((rawH * fit) / 2) * 2);
+              const { fastRecorderProbe } = await chrome.storage.local.get([
+                "fastRecorderProbe",
+              ]);
+              const probeConfig =
+                fastRecorderProbe?.details?.selectedVideoConfig || null;
+              void startEncoderPrewarm({
+                width: warmW,
+                height: warmH,
+                codec: probeConfig?.codec || "avc1.64002A",
+                bitrate: Number(probeConfig?.bitrate) || 4_000_000,
+                framerate: Number(probeConfig?.framerate) || fps || 30,
+              });
+            }
+          } catch {}
         } else {
           chrome.runtime.sendMessage({
             type: "recording-error",

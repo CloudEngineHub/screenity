@@ -84,6 +84,178 @@ export function computeAvcCappedDimensions({
   return { width, height, capped: { perDim: perDimCapped, area: areaCapped } };
 }
 
+// Backpressure ate ~67% of the opening frames at 1080p while a cold encoder
+// ramped. Buffered frames keep wall-clock PTS, so they encode late but land.
+export const STARTUP_QUEUE_CAP = 60;
+// Whichever hits first ends the grace window.
+export const STARTUP_HARD_FRAME_LIMIT = 90;
+export const STARTUP_HARD_MS = 3000;
+// Drained depth, and how many frames must hold there to count as caught up.
+export const STARTUP_CAUGHT_UP_QUEUE = 2;
+export const STARTUP_CAUGHT_UP_RUN = 10;
+
+// 4, not NV12's 1.5: canvas-backed frames stay RGBA until the encoder converts
+// them, so NV12 undercounts the queue by ~2.7x.
+export const FRAME_BYTES_PER_PIXEL = 4;
+
+// The startup window is transient (~1s) so it can borrow more; the steady
+// depth is held all recording, and 16 frames at 4K would cost ~530MB.
+export const STARTUP_QUEUE_BYTE_BUDGET = 384 * 1024 * 1024;
+export const STEADY_QUEUE_BYTE_BUDGET = 160 * 1024 * 1024;
+export const STEADY_QUEUE_CAP = 16;
+export const STEADY_QUEUE_MIN = 4;
+
+export function computeStartupQueueCap({
+  width,
+  height,
+  maxFrames = STARTUP_QUEUE_CAP,
+  byteBudget = STARTUP_QUEUE_BYTE_BUDGET,
+  steadyCap = 4,
+} = {}) {
+  if (
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    width <= 0 ||
+    height <= 0
+  ) {
+    return maxFrames;
+  }
+  const frameBytes = width * height * FRAME_BYTES_PER_PIXEL;
+  const byFrames = Math.floor(byteBudget / frameBytes);
+  return Math.max(steadyCap, Math.min(maxFrames, byFrames));
+}
+
+// Steady-state backpressure cap, bounded by the same byte budget. Unlike the
+// startup window this depth is a sustained memory cost, not a transient one.
+export function computeSteadyQueueCap({
+  width,
+  height,
+  maxFrames = STEADY_QUEUE_CAP,
+  byteBudget = STEADY_QUEUE_BYTE_BUDGET,
+  minFrames = STEADY_QUEUE_MIN,
+} = {}) {
+  if (
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    width <= 0 ||
+    height <= 0
+  ) {
+    return maxFrames;
+  }
+  const frameBytes = width * height * FRAME_BYTES_PER_PIXEL;
+  const byFrames = Math.floor(byteBudget / frameBytes);
+  return Math.max(minFrames, Math.min(maxFrames, byFrames));
+}
+
+// Cap for the frame about to be encoded. Returns the steady cap once the
+// encoder catches up or the window expires; the caller latches that answer
+// so the window never reopens.
+export function computeEffectiveQueueCap({
+  framesSinceStart = 0,
+  elapsedMs = 0,
+  caughtUp = false,
+  steadyCap = 4,
+  startupCap = STARTUP_QUEUE_CAP,
+  hardFrameLimit = STARTUP_HARD_FRAME_LIMIT,
+  hardMs = STARTUP_HARD_MS,
+  disabled = false,
+} = {}) {
+  const steady = Number.isFinite(steadyCap) ? steadyCap : 4;
+  if (disabled) return steady;
+  if (caughtUp) return steady;
+  if (Number.isFinite(hardFrameLimit) && framesSinceStart > hardFrameLimit) {
+    return steady;
+  }
+  if (Number.isFinite(hardMs) && elapsedMs > hardMs) return steady;
+  const startup = Number.isFinite(startupCap) ? startupCap : steady;
+  return Math.max(steady, startup);
+}
+
+// Early-exit bar for the warm loop, bounded by frames/ms so a stuck warm
+// gives up. The bar for counting as warm is PREWARM_MIN_WARM_CHUNKS.
+export const PREWARM_READY_CHUNKS = 30;
+export const PREWARM_MAX_FRAMES = 150;
+export const PREWARM_MAX_MS = 4000;
+// 1, not a real count: a slow cold encoder emits only a handful in the warm
+// window and is still warm (measured: 4 chunks, then 0 drops at queue 0).
+export const PREWARM_MIN_WARM_CHUNKS = 1;
+// An unclaimed warm encoder holds a HW slot. If nothing adopts it in this
+// window the recording took another path; close it.
+export const PREWARM_UNCLAIMED_MAX_MS = 20000;
+
+// Warm-until-ready predicate: enough chunks out AND the queue drained, or a
+// bound was hit (ready=false, done=true means give up and stop feeding).
+export function evaluatePrewarmProgress({
+  chunksOut = 0,
+  queueSize = 0,
+  framesFed = 0,
+  elapsedMs = 0,
+  minChunks = PREWARM_READY_CHUNKS,
+  maxFrames = PREWARM_MAX_FRAMES,
+  maxMs = PREWARM_MAX_MS,
+} = {}) {
+  if (chunksOut >= minChunks && queueSize === 0) {
+    return { ready: true, done: true, reason: "warm" };
+  }
+  if (framesFed >= maxFrames) {
+    return { ready: false, done: true, reason: "frame-limit" };
+  }
+  if (elapsedMs >= maxMs) {
+    return { ready: false, done: true, reason: "time-limit" };
+  }
+  return { ready: false, done: false, reason: "feeding" };
+}
+
+// The warm encoder was configured at the ceiling; the recording may run at
+// smaller dims. Reconfiguring a drained encoder is free but pointless when
+// nothing the session cares about differs.
+export function shouldReconfigureAdoptedEncoder(warmConfig, finalConfig) {
+  if (!warmConfig || !finalConfig) return true;
+  const keys = [
+    "codec",
+    "width",
+    "height",
+    "bitrate",
+    "framerate",
+    "bitrateMode",
+    "latencyMode",
+    "hardwareAcceleration",
+  ];
+  return keys.some((k) => {
+    const a = warmConfig[k];
+    const b = finalConfig[k];
+    if (a === undefined && b === undefined) return false;
+    return a !== b;
+  });
+}
+
+// Only what the SPS describes invalidates the captured decoderConfig: codec
+// and coded dims. Bitrate/framerate/latencyMode don't, and nulling the replay
+// for those loses the header-only-file safety net for no reason.
+export function shouldInvalidateDecoderConfig(warmConfig, finalConfig) {
+  if (!warmConfig || !finalConfig) return true;
+  return ["codec", "width", "height"].some(
+    (k) => warmConfig[k] !== finalConfig[k],
+  );
+}
+
+// Adoption gate. The warm encoder is hardware-preferred, so a session that
+// asked for software must build its own.
+export function canAdoptPrewarmedEncoder({
+  hasWarmer = false,
+  warm = false,
+  claimed = false,
+  closed = false,
+  encoderState = null,
+  disabled = false,
+  allowAdopt = true,
+  preferSoftware = false,
+} = {}) {
+  if (disabled || !allowAdopt || preferSoftware) return false;
+  if (!hasWarmer || !warm || claimed || closed) return false;
+  return encoderState === "configured";
+}
+
 // Skip a rebuild if the last one was within the throttle window;
 // otherwise encoder.error fires per frame and burns the cap in ms.
 export function shouldThrottleReclaimRebuild(

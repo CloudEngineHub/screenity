@@ -4,6 +4,7 @@
 
 import { WebCodecsRecorder } from "../../Recorder/webcodecs/WebCodecsRecorder";
 import { closeActiveEncoderPrewarm } from "../../Recorder/encoderPrewarm";
+import { isWarmAdoptEnabled } from "../../Recorder/webcodecs/startupFlags";
 
 const dispatchError = (cb, err) => {
   if (typeof cb !== "function") return;
@@ -27,6 +28,7 @@ export class WebCodecsTrackRecorder {
     this.preferSoftware = Boolean(options.preferSoftware);
     // Namespaces the decoderConfig sidecar so dual-track keys don't collide.
     this.trackKind = options.trackKind || "default";
+    this.encodeStats = null;
     // MediaRecorder-shape fields used by callers.
     this._state = "inactive";
     this.ondataavailable = null;
@@ -56,6 +58,16 @@ export class WebCodecsTrackRecorder {
   // re-derive profile/level. Null until the first chunk emits.
   get actualVideoCodec() {
     return this._recorder?.actualVideoCodec || null;
+  }
+
+  // Falls back to the live recorder so a session that never finalized (stall,
+  // zero frames, failed start) still reports its counters.
+  getEncodeStats() {
+    try {
+      return this.encodeStats || this._recorder?.getEncodeStats?.() || null;
+    } catch {
+      return this.encodeStats || null;
+    }
   }
 
   // Diagnostic counters; safe to poll mid-recording and after stop.
@@ -95,7 +107,13 @@ export class WebCodecsTrackRecorder {
       }
     };
 
-    const handleFinalized = () => {
+    const handleFinalized = (payload) => {
+      // Keep the encoder's own numbers. onFinalized was called for its side
+      // effect and the payload dropped, so every prod session recorded
+      // encodeStats: null.
+      try {
+        this.encodeStats = this._recorder?.getEncodeStats?.() || null;
+      } catch {}
       if (this._finalizedResolved) return;
       this._finalizedResolved = true;
       this._state = "inactive";
@@ -144,7 +162,13 @@ export class WebCodecsTrackRecorder {
       } catch {}
     };
 
+    // Screen only: the prewarm is sized and hardware-preferred for screen,
+    // and cloud's camera track is often forced to software anyway.
+    const adoptPrewarm =
+      isWarmAdoptEnabled() && this.trackKind === "screen" && !this.preferSoftware;
+
     this._recorder = new WebCodecsRecorder(this.stream, {
+      allowPrewarmAdopt: adoptPrewarm,
       onChunk: handleChunk,
       onFinalized: handleFinalized,
       onError: handleError,
@@ -162,9 +186,15 @@ export class WebCodecsTrackRecorder {
     this._state = "recording";
 
     // MediaRecorder.start() is sync to callers; dispatch and route errors
-    // via onerror. Release the prewarm HW slot first or VideoToolbox contends.
+    // via onerror. Release the prewarm HW slot first or VideoToolbox
+    // contends, unless this track adopts it. Camera never disposes it: that
+    // would race the screen track's claim.
+    const releasePrewarm = () => {
+      if (adoptPrewarm || this.trackKind !== "screen") return null;
+      return closeActiveEncoderPrewarm().catch(() => {});
+    };
     Promise.resolve()
-      .then(() => closeActiveEncoderPrewarm().catch(() => {}))
+      .then(releasePrewarm)
       .then(() => this._recorder.start())
       .catch((err) => handleError(err));
   }

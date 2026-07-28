@@ -25,6 +25,7 @@ import {
   startEncoderPrewarm,
   closeActiveEncoderPrewarm,
 } from "./encoderPrewarm";
+import { isWarmAdoptEnabled } from "./webcodecs/startupFlags";
 import { getUserMediaWithFallback } from "../utils/mediaDeviceFallback";
 import { startAudioStream as acquireMicStream } from "../utils/startAudioStream";
 import { shouldAcquireMicAtStart } from "../utils/micAcquisitionPolicy";
@@ -1299,7 +1300,13 @@ const Recorder = () => {
 
     // Fire-and-forget: awaiting leaves a reader gap that macOS reads as
     // "no demand" and puts capture to sleep (5s re-spin, frozen first frame).
-    endPrewarm({ keepClear: true, keepWriter: true });
+    // keepEncoderWarm: the path into a recording, so the warm encoder has to
+    // survive for the recorder to adopt it. The claim disposes it otherwise.
+    endPrewarm({
+      keepClear: true,
+      keepWriter: true,
+      keepEncoderWarm: isWarmAdoptEnabled(),
+    });
 
     recordingStartTime.current = Date.now();
 
@@ -1950,12 +1957,15 @@ const Recorder = () => {
           audioBitsPerSecond,
         });
 
-        // Close prewarm before opening the real encoder; some macOS
-        // configs only allow one VTDecoder per process. The OS
-        // service stays warm for several seconds after close.
-        try {
-          await closeActiveEncoderPrewarm();
-        } catch {}
+        // With warm-adopt on, the recorder claims (or disposes) the prewarmed
+        // encoder itself, so closing here would throw the warm session away.
+        // Otherwise close first: some macOS configs only allow one VTDecoder
+        // per process.
+        if (!isWarmAdoptEnabled()) {
+          try {
+            await closeActiveEncoderPrewarm();
+          } catch {}
+        }
 
         recorder.current = new WebCodecsRecorder(liveStream.current, {
           width,
@@ -2432,6 +2442,9 @@ const Recorder = () => {
 
         try {
           if (!recorder.current) {
+            // MediaRecorder never adopts the warm encoder; release the HW
+            // slot rather than leaving it to the unclaimed-prewarm timeout.
+            closeActiveEncoderPrewarm().catch(() => {});
             try {
               recorder.current = createMediaRecorder(liveStream.current, {
                 audioBitsPerSecond,
@@ -3039,7 +3052,11 @@ const Recorder = () => {
     }
   }
 
-  async function endPrewarm({ keepClear = false, keepWriter = false } = {}) {
+  async function endPrewarm({
+    keepClear = false,
+    keepWriter = false,
+    keepEncoderWarm = false,
+  } = {}) {
     const ctrl = prewarmRef.current;
     prewarmRef.current = null;
     if (!keepClear) {
@@ -3058,12 +3075,13 @@ const Recorder = () => {
           .catch(() => {});
       }
     }
-    // Tear down the encoder prewarm too; if endPrewarm runs because
-    // the user cancelled the start flow, the prewarm encoder would
-    // otherwise sit ticking its keep-alive every 800ms.
-    try {
-      await closeActiveEncoderPrewarm();
-    } catch {}
+    // Tear down the encoder prewarm too, so a cancelled start flow doesn't
+    // leave an encoder sitting on a HW slot.
+    if (!keepEncoderWarm) {
+      try {
+        await closeActiveEncoderPrewarm();
+      } catch {}
+    }
     await stopPrewarm(ctrl);
   }
 
@@ -4066,13 +4084,37 @@ const Recorder = () => {
 
     beginPrewarm(liveStream.current);
 
-    // Open a synthetic encoder so the OS service is warm by the time
-    // the real encoder opens. Closed in preflight; failure no-ops.
+    // Warm a real encoder so the recording starts ramped instead of dropping
+    // its opening frames. Adopted (or disposed) in preflight; failure no-ops.
     try {
       const vTrack = liveStream.current?.getVideoTracks?.()[0];
       const settings = vTrack?.getSettings?.() || {};
-      const w = Number(settings.width) || 0;
-      const h = Number(settings.height) || 0;
+      const rawW = Number(settings.width) || 0;
+      const rawH = Number(settings.height) || 0;
+      // Capture is oversampled 2x but the encoder runs at the tier, so warm
+      // at the tier. Same fit maths as preflight.
+      let w = rawW;
+      let h = rawH;
+      try {
+        // Only worth paying for when an encoder will actually be adopted:
+        // these are sequential storage IPCs on the start path, which a
+        // throttled background tab can take 11-19s to answer.
+        if (!isWarmAdoptEnabled()) throw new Error("warm-adopt-disabled");
+        const { qualityValue: storedQuality } = await chrome.storage.local.get([
+          "qualityValue",
+        ]);
+        const { isPro, maxQuality } = await getFreeCaptureCaps();
+        const tierQuality = isPro
+          ? storedQuality
+          : clampQualityValue(storedQuality, maxQuality);
+        const { width: tierW, height: tierH } =
+          getResolutionForQuality(tierQuality);
+        if (rawW > 0 && rawH > 0 && tierW > 0 && tierH > 0) {
+          const fit = Math.min(tierW / rawW, tierH / rawH, 1);
+          w = Math.max(2, Math.round((rawW * fit) / 2) * 2);
+          h = Math.max(2, Math.round((rawH * fit) / 2) * 2);
+        }
+      } catch {}
       if (w > 0 && h > 0) {
         const probeData = await chrome.storage.local.get([
           "fastRecorderProbe",

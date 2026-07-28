@@ -321,6 +321,10 @@ const CloudRecorder = () => {
   const recoveryExportedRef = useRef(false);
   const screenTrackLostRef = useRef(false);
   const screenTrackMonitor = useRef(null);
+  // null = not muted; the reported flag keeps the breadcrumb to one per
+  // mute stretch.
+  const screenTrackMutedSinceRef = useRef(null);
+  const screenTrackMuteReportedRef = useRef(false);
   // Capture identity (recordingType/surface enums only, no labels/URLs) for
   // forensic telemetry, so a frozen session's capture mechanism is known.
   const captureContextRef = useRef(null);
@@ -701,6 +705,18 @@ const CloudRecorder = () => {
       event: {
         type: eventPayload.event,
         t: eventPayload.ts || Date.now(),
+        // `recording_forensic_event` is one type covering many events (track
+        // mute/end, visibility, focus, page freeze). Without name/tMs the
+        // whole forensic channel lands indistinguishable.
+        name: typeof eventPayload.name === "string" ? eventPayload.name : null,
+        tMs:
+          typeof eventPayload.tMs === "number" ? eventPayload.tMs : null,
+        // How long the screen track stayed `muted`
+        // (screen-track-muted-sustained / -mute-cleared).
+        mutedMs:
+          typeof eventPayload.mutedMs === "number"
+            ? eventPayload.mutedMs
+            : null,
         trackType: eventPayload.trackType || null,
         offsetBytes:
           typeof eventPayload.offset === "number"
@@ -752,6 +768,35 @@ const CloudRecorder = () => {
             : null,
         encoderStickyReason:
           eventPayload.encoderStickyReason || encoderSticky.reason || null,
+        // Capture identity. `event` is a fixed allowlist, so these were
+        // dropped client-side before the server sanitizer saw them: that's
+        // why upload_sessions logs recordingType/isTab/region as "unknown" on
+        // every session. Enums and booleans only, no labels or URLs.
+        recordingType: eventPayload.recordingType || recordingType.current || null,
+        isTab:
+          typeof eventPayload.isTab === "boolean"
+            ? eventPayload.isTab
+            : Boolean(isTab.current),
+        region:
+          typeof eventPayload.region === "boolean"
+            ? eventPayload.region
+            : Boolean(regionRef.current),
+        // Null on tab capture: displaySurface only exists on getDisplayMedia
+        // tracks, so isTab/region are what separate tab from screen.
+        screenSurface:
+          eventPayload.screenSurface ||
+          captureContextRef.current?.screenSurface ||
+          null,
+        // "No sound in my recording" is unanswerable without knowing whether
+        // they asked for sound at all.
+        micActive:
+          typeof eventPayload.micActive === "boolean"
+            ? eventPayload.micActive
+            : Boolean(audioIntent.current?.micActive),
+        systemAudio:
+          typeof eventPayload.systemAudio === "boolean"
+            ? eventPayload.systemAudio
+            : Boolean(audioIntent.current?.systemAudio),
         storageBackend: eventPayload.storageBackend || null,
         storageInitMs:
           typeof eventPayload.storageInitMs === "number"
@@ -764,6 +809,9 @@ const CloudRecorder = () => {
         // event types (recording_heartbeat, recording_stop_diag,
         // recording_failed_bundle); null otherwise. The server
         // sanitizer drops them cleanly when absent.
+        // In `event`, not at the request root: nested objects here are a
+        // shape the server sanitizes, an unknown root key risks the body.
+        encodeStats: eventPayload.encodeStats || null,
         screenDiag: eventPayload.screenDiag || null,
         cameraDiag: eventPayload.cameraDiag || null,
         audioDiag: eventPayload.audioDiag || null,
@@ -902,12 +950,24 @@ const CloudRecorder = () => {
       Number(cameraUploader.current?.offset) ||
       0;
     const serverBytesConfirmed = screenServerBytes + cameraServerBytes;
+    // Peak queue depth and backpressure drops ride the outcome event: it's
+    // the only fleet-wide read on whether the steady cap fits hardware we
+    // can't test. Tagged by track, since a hardware screen encoder and a
+    // software camera encoder queue very differently.
+    const screenStats = screenRecorder.current?.getEncodeStats?.() || null;
+    const cameraStats = cameraRecorder.current?.getEncodeStats?.() || null;
+    const encodeStats = screenStats
+      ? { ...screenStats, track: "screen" }
+      : cameraStats
+        ? { ...cameraStats, track: "camera" }
+        : null;
     void emitUploadTelemetry("recording_outcome", {
       outcome,
       durationMs,
       chunksPersisted,
       serverBytesConfirmed,
       uploaderType: "cloud_recorder",
+      encodeStats,
       ...extra,
     });
   };
@@ -1285,6 +1345,8 @@ const CloudRecorder = () => {
   const bindScreenTrack = (track) => {
     if (!track) return;
     screenTrackLostRef.current = false;
+    screenTrackMutedSinceRef.current = null;
+    screenTrackMuteReportedRef.current = false;
     // Capture identity from the bound track (fires on every acquisition path).
     // Enums and booleans only, no track.label/title/URL.
     try {
@@ -1414,6 +1476,35 @@ const CloudRecorder = () => {
           );
           stopRecording(true, "screen-track-monitor-ended");
         }
+        return;
+      }
+
+      // `muted` with readyState still "live" delivers nothing, but the
+      // static-frame fallback keeps re-encoding the last frame so every other
+      // guard sees a healthy recording. Observe-only: mute fires transiently
+      // (crbug 40200910), so stopping here would kill recoverable sessions.
+      const muted = track.muted === true;
+      if (muted && !screenTrackMutedSinceRef.current) {
+        screenTrackMutedSinceRef.current = Date.now();
+      } else if (!muted && screenTrackMutedSinceRef.current) {
+        logForensicEvent("screen-track-mute-cleared", {
+          mutedMs: Date.now() - screenTrackMutedSinceRef.current,
+        });
+        screenTrackMutedSinceRef.current = null;
+        screenTrackMuteReportedRef.current = false;
+      }
+      if (
+        muted &&
+        screenTrackMutedSinceRef.current &&
+        !screenTrackMuteReportedRef.current &&
+        Date.now() - screenTrackMutedSinceRef.current >= 10000
+      ) {
+        // Once per sustained mute, not every 5s tick.
+        screenTrackMuteReportedRef.current = true;
+        logScreenTrackEvent("monitor-muted-sustained", track);
+        logForensicEvent("screen-track-muted-sustained", {
+          mutedMs: Date.now() - screenTrackMutedSinceRef.current,
+        });
       }
     }, 5000);
   };
@@ -4164,6 +4255,13 @@ const CloudRecorder = () => {
           },
         });
         screenRecorder.current = screenSelection.recorder;
+        // Only WebCodecsTrackRecorder disposes the prewarm. On the
+        // MediaRecorder fallback nothing would, leaving a configured hardware
+        // encoder held for the whole recording (the prewarm no longer
+        // self-closes after 6 frames).
+        if (screenSelection.kind !== "webcodecs") {
+          closeActiveEncoderPrewarm().catch(() => {});
+        }
         encoderKinds.screen = screenSelection.kind;
         trackContainers.screen = screenSelection.container;
         trackCodecs.screen = screenSelection.codec;
@@ -6374,8 +6472,21 @@ const CloudRecorder = () => {
           // warm the OS encoder so the real one hits 30fps from frame 1
           // instead of crawling for the first ~30 frames. mirrors Recorder.jsx.
           try {
-            const w = Number(settings.width) || 0;
-            const h = Number(settings.height) || 0;
+            const rawW = Number(settings.width) || 0;
+            const rawH = Number(settings.height) || 0;
+            // The screen encoder is hard-capped at 1080p (WEBCODECS_CAP) and
+            // WCR downscales onto its resize canvas, so warm at the encode
+            // size rather than the capture size.
+            const hasSize = rawW > 0 && rawH > 0;
+            const capFit = hasSize
+              ? Math.min(1920 / rawW, 1080 / rawH, 1)
+              : 1;
+            const w = hasSize
+              ? Math.max(2, Math.round((rawW * capFit) / 2) * 2)
+              : 0;
+            const h = hasSize
+              ? Math.max(2, Math.round((rawH * capFit) / 2) * 2)
+              : 0;
             if (w > 0 && h > 0) {
               const { fastRecorderProbe } = await chrome.storage.local.get([
                 "fastRecorderProbe",
