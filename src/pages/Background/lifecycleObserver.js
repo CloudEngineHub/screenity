@@ -2,6 +2,7 @@
 // recording-state keys and logs them to lifecycleLog so we don't have
 // to instrument each BG call site. wired once at SW startup.
 import { lifecycle } from "../utils/lifecycleLog";
+import { handleTabActivation } from "./listeners/onTabActivatedListener";
 
 // Keys whose transitions we care about for cross-recording bug analysis.
 // `lifecycleLog` itself is excluded to avoid infinite recursion.
@@ -80,6 +81,19 @@ export const initLifecycleObserver = () => {
         });
       } catch (err) {
         console.warn("[Screenity][BG] reactive setIcon failed:", err);
+      }
+
+      // Hand the UI to the focused tab. onActivated has no branch for the
+      // countdown window, so a tab switched to mid-countdown never got it.
+      if (changes.recording.newValue === true) {
+        try {
+          chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+            const tabId = tabs?.[0]?.id;
+            if (tabId) void handleTabActivation({ tabId });
+          });
+        } catch (err) {
+          console.warn("[Screenity][BG] recording-start UI handoff failed:", err);
+        }
       }
     }
   });

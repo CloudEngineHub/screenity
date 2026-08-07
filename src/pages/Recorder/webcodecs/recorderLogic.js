@@ -38,6 +38,19 @@ export function isAacRateInSpec(rate) {
   return Number.isFinite(rate) && AAC_SUPPORTED_RATES.has(rate);
 }
 
+// The probe's config carries its own bitrate/framerate from probing at
+// 1280x720; reused verbatim it pinned every recording to the probe's 4 Mbps.
+// Codec from the probe, rate settings from the caller.
+export function applyEncoderConfigOverrides(
+  probeConfig,
+  { width, height, bitrate, framerate },
+) {
+  const config = { ...probeConfig, width, height };
+  if (Number.isFinite(bitrate) && bitrate > 0) config.bitrate = bitrate;
+  if (Number.isFinite(framerate) && framerate > 0) config.framerate = framerate;
+  return config;
+}
+
 // Cap each dim by min(userMax, hardCap), preserve aspect, round even
 // (H.264 requirement) with min 32, then scale down if total pixels
 // still exceed avcMaxPixels.

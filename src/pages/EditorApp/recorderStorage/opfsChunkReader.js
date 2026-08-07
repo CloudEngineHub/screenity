@@ -14,6 +14,8 @@ const FINALIZE_HARD_TIMEOUT_MS = 60_000;
 const FINALIZE_ABSOLUTE_TIMEOUT_MS = 300_000;
 // don't flash the "finalizing" UI for the common <1s case
 const SLOW_FINALIZE_NOTIFY_MS = 600;
+// 4x the recorder's 1s heartbeat, so a killed writer still fails fast.
+const WRITER_HEARTBEAT_STALE_MS = 4000;
 
 const diagForward = (event, data) => {
   try {
@@ -42,17 +44,29 @@ export class OpfsChunkReader {
 
   async _readRefState() {
     try {
-      const { lastRecordingBackendRef, lastRecordingFinalizedFileName } =
-        await chrome.storage.local.get([
-          "lastRecordingBackendRef",
-          "lastRecordingFinalizedFileName",
-        ]);
+      const {
+        lastRecordingBackendRef,
+        lastRecordingFinalizedFileName,
+        lastRecordingWriterHeartbeat,
+      } = await chrome.storage.local.get([
+        "lastRecordingBackendRef",
+        "lastRecordingFinalizedFileName",
+        "lastRecordingWriterHeartbeat",
+      ]);
+      // Only a live recorder refreshes this, and only while finalizing. The file
+      // name has to match or a leftover from the previous recording counts.
+      const hb = lastRecordingWriterHeartbeat;
+      const writerAlive =
+        hb?.fileName === this._fileName &&
+        Number.isFinite(hb?.at) &&
+        Date.now() - hb.at < WRITER_HEARTBEAT_STALE_MS;
       return {
         sameFile: lastRecordingBackendRef?.fileName === this._fileName,
         finalized: lastRecordingFinalizedFileName === this._fileName,
+        writerAlive,
       };
     } catch {
-      return { sameFile: false, finalized: false };
+      return { sameFile: false, finalized: false, writerAlive: false };
     }
   }
 
@@ -87,7 +101,7 @@ export class OpfsChunkReader {
 
     // !sameFile means a newer recording replaced the ref (our writer is
     // gone, or we're opening an orphan file). sameFile && finalized means
-    // the writer closed cleanly. otherwise wait for one of those — but
+    // the writer closed cleanly. otherwise wait for one of those, but
     // also watch the file size: if the writer dies without emitting the
     // finalized marker (recorder tab killed, SW restart mid-flush, track
     // ended mid-write), polling will time out at 60s for no reason. When
@@ -102,6 +116,7 @@ export class OpfsChunkReader {
       const SIZE_STABLE_MIN_WAIT_MS = 1500;
       let writerDead = false;
       let writerEmpty = false;
+      let writerAlive = false;
       while (true) {
         const elapsed = Date.now() - startedAt;
         // only time out once the size stops changing; a still-growing file
@@ -119,10 +134,10 @@ export class OpfsChunkReader {
           notifySlow();
         }
         await wait(FINALIZE_POLL_INTERVAL_MS);
-        ({ sameFile, finalized } = await this._readRefState());
+        ({ sameFile, finalized, writerAlive } = await this._readRefState());
         if (finalized || !sameFile) break;
         // Size-stability check. Probing the file inside the poll loop is
-        // cheap — getFile is metadata only on chromium.
+        // cheap: getFile is metadata only on chromium.
         try {
           const probe = await handle.getFile();
           if (probe.size !== lastSize) {
@@ -131,7 +146,10 @@ export class OpfsChunkReader {
           } else if (
             sizeStableSince > 0 &&
             Date.now() - sizeStableSince >= SIZE_STABLE_MS &&
-            Date.now() - startedAt >= SIZE_STABLE_MIN_WAIT_MS
+            Date.now() - startedAt >= SIZE_STABLE_MIN_WAIT_MS &&
+            // A flush writes nothing for up to 15s per track, so a static file
+            // only means a dead writer once it stops checking in.
+            !writerAlive
           ) {
             // A file stuck below the minimum (usually 0 bytes, from a session
             // that never captured) used to be excluded here, so it waited out

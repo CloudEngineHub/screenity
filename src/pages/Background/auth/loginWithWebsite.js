@@ -230,6 +230,12 @@ export const loginWithWebsite = async (arg = {}) => {
       instantMode: instantMode || false,
     };
   } catch (err) {
+    console.warn(
+      "[Screenity][Auth] verify failed:",
+      err?.name,
+      err?.message,
+      `tokenInvalid=${isTokenInvalid}`,
+    );
     if (isTokenInvalid) {
       if (_depth >= MAX_REFRESH_DEPTH) {
         console.warn(

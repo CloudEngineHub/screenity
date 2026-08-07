@@ -9,7 +9,19 @@
  */
 const REMUX_OFFSCREEN_URL = "remuxoffscreen.html";
 
-export const ensureRemuxOffscreen = async () => {
+// Concurrent remux requests each passed the check below and called createDocument.
+// Chrome permits one document, so the loser fell back to slow in-editor BufferTarget.
+let inFlightEnsure = null;
+
+export const ensureRemuxOffscreen = () => {
+  if (inFlightEnsure) return inFlightEnsure;
+  inFlightEnsure = ensureRemuxOffscreenImpl().finally(() => {
+    inFlightEnsure = null;
+  });
+  return inFlightEnsure;
+};
+
+const ensureRemuxOffscreenImpl = async () => {
   if (!chrome.offscreen || typeof chrome.offscreen.createDocument !== "function") {
     throw new Error("offscreen-api-unavailable");
   }
@@ -49,10 +61,21 @@ export const ensureRemuxOffscreen = async () => {
     break;
   }
 
-  await chrome.offscreen.createDocument({
-    url: REMUX_OFFSCREEN_URL,
-    reasons: ["WORKERS"],
-    justification:
-      "Re-mux fragmented MP4 recording to standard MP4 using a worker that writes to OPFS via a sync access handle.",
-  });
+  try {
+    await chrome.offscreen.createDocument({
+      url: REMUX_OFFSCREEN_URL,
+      reasons: ["WORKERS"],
+      justification:
+        "Re-mux fragmented MP4 recording to standard MP4 using a worker that writes to OPFS via a sync access handle.",
+    });
+  } catch (err) {
+    // getContexts and createDocument are not atomic, so something can claim the
+    // single slot in between. If what landed is ours, that is a success.
+    const contexts = await chrome.runtime.getContexts({}).catch(() => []);
+    const landed = contexts.find((c) => c.contextType === "OFFSCREEN_DOCUMENT");
+    const landedUrl =
+      typeof landed?.documentUrl === "string" ? landed.documentUrl : "";
+    if (landedUrl.endsWith(REMUX_OFFSCREEN_URL)) return;
+    throw err;
+  }
 };

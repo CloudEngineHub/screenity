@@ -7,41 +7,72 @@ const CLOUD_FEATURES_ENABLED =
 const APP_BASE = process.env.SCREENITY_APP_BASE;
 // debounce in-tab triggers so navigation chatter doesn't hammer /auth/refresh
 const APP_AUTH_REFRESH_DEBOUNCE_MS = 10_000;
+// A login the user just started is worth polling harder, but /auth/refresh
+// allows 5 per user per minute, so stay under that or the retries 429 us out.
+const LOGIN_PENDING_DEBOUNCE_MS = 15_000;
+const LOGIN_PENDING_TTL_MS = 15 * 60_000;
 let lastAppAuthRefreshAt = 0;
 const tryAppAuthRefresh = async (url) => {
   if (!CLOUD_FEATURES_ENABLED || !APP_BASE || !url) return;
   if (!url.startsWith(APP_BASE)) return;
   const now = Date.now();
-  if (now - lastAppAuthRefreshAt < APP_AUTH_REFRESH_DEBOUNCE_MS) return;
   const {
     isLoggedIn,
     wasLoggedIn,
     hasSubscribedBefore,
     screenityUser,
     stayLoggedOut,
+    loginPendingAt,
+    loginTabId,
   } = await chrome.storage.local.get([
     "isLoggedIn",
     "wasLoggedIn",
     "hasSubscribedBefore",
     "screenityUser",
     "stayLoggedOut",
+    "loginPendingAt",
+    "loginTabId",
   ]);
   if (isLoggedIn) return;
   if (stayLoggedOut) return;
+  const loginPending =
+    Boolean(loginPendingAt) && now - loginPendingAt < LOGIN_PENDING_TTL_MS;
+  if (loginPendingAt && !loginPending) {
+    await chrome.storage.local.remove(["loginPendingAt", "loginTabId"]);
+  }
   // Only refresh if there's prior evidence of an account, otherwise every
   // logged-out visitor hits /auth/refresh and 401s. Mirrors the priorSignals
   // gate in loginWithWebsite (force:true would bypass it).
   const hasPriorSignals =
+    loginPending ||
     Boolean(wasLoggedIn) ||
     Boolean(hasSubscribedBefore) ||
     Boolean(screenityUser);
   if (!hasPriorSignals) return;
+  const debounceMs = loginPending
+    ? LOGIN_PENDING_DEBOUNCE_MS
+    : APP_AUTH_REFRESH_DEBOUNCE_MS;
+  if (now - lastAppAuthRefreshAt < debounceMs) return;
   lastAppAuthRefreshAt = now;
-  loginWithWebsite({ force: true }).catch(() => {});
+  const result = await loginWithWebsite({ force: true }).catch(() => null);
+  if (!result?.authenticated || !loginPending) return;
+  // Cookie refresh got there without AUTH_SUCCESS. loginWithWebsite already
+  // refocused the original tab, so all that's left is the login tab we opened.
+  await chrome.storage.local.remove(["loginPendingAt", "loginTabId"]);
+  if (loginTabId) {
+    try {
+      await chrome.tabs.remove(loginTabId);
+    } catch {}
+  }
 };
 
 export const handleTabUpdate = async (tabId, changeInfo, tab) => {
   try {
+    // The app routes client-side, so a post-login redirect fires url without
+    // ever reaching status complete.
+    if (changeInfo.url) {
+      tryAppAuthRefresh(changeInfo.url).catch(() => {});
+    }
     if (changeInfo.status === "complete") {
       const {
         recording,

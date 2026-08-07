@@ -98,17 +98,31 @@ const Dropdown = (props) => {
         });
         setLabel(chrome.i18n.getMessage("noCameraDropdownLabel"));
       } else {
+        // Toggling on left the device at "none" and the label unset. Adopt the
+        // first camera here, same as the permission grant does.
+        const devices = contentState.videoInput || [];
+        const selected =
+          devices.find(
+            (device) => device.deviceId === contentState.defaultVideoInput
+          ) ||
+          devices[0] ||
+          null;
+        const patch = selected
+          ? {
+              cameraActive: true,
+              defaultVideoInput: selected.deviceId,
+              defaultVideoInputLabel: selected.label || "",
+            }
+          : { cameraActive: true };
         setContentState((prevContentState) => ({
           ...prevContentState,
-          cameraActive: true,
+          ...patch,
         }));
-        chrome.storage.local.set({
-          cameraActive: true,
-        });
+        chrome.storage.local.set(patch);
         setLabel(
-          contentState.videoInput.find(
-            (device) => device.deviceId === contentState.defaultVideoInput
-          ).label
+          selected
+            ? selected.label
+            : chrome.i18n.getMessage("noCameraDropdownLabel")
         );
       }
     } else {
@@ -122,17 +136,29 @@ const Dropdown = (props) => {
         });
         setLabel(chrome.i18n.getMessage("noMicrophoneDropdownLabel"));
       } else {
+        const devices = contentState.audioInput || [];
+        const selected =
+          devices.find(
+            (device) => device.deviceId === contentState.defaultAudioInput
+          ) ||
+          devices[0] ||
+          null;
+        const patch = selected
+          ? {
+              micActive: true,
+              defaultAudioInput: selected.deviceId,
+              defaultAudioInputLabel: selected.label || "",
+            }
+          : { micActive: true };
         setContentState((prevContentState) => ({
           ...prevContentState,
-          micActive: true,
+          ...patch,
         }));
-        chrome.storage.local.set({
-          micActive: true,
-        });
+        chrome.storage.local.set(patch);
         setLabel(
-          contentState.audioInput.find(
-            (device) => device.deviceId === contentState.defaultAudioInput
-          ).label
+          selected
+            ? selected.label
+            : chrome.i18n.getMessage("noMicrophoneDropdownLabel")
         );
       }
     }

@@ -19,6 +19,7 @@ import {
   computeAvcCappedDimensions,
   computeEffectiveQueueCap,
   computeStartupQueueCap,
+  applyEncoderConfigOverrides,
   computeSteadyQueueCap,
   isAacRateInSpec,
   isReclaimErrorMessage,
@@ -33,6 +34,7 @@ import {
   STARTUP_QUEUE_CAP,
 } from "./recorderLogic";
 import { getStartupFlags } from "./startupFlags";
+import { orientBoxToSource } from "../recorderConfig";
 import { claimPrewarmedEncoder } from "../encoderPrewarm";
 // Lazy-load Mp4MuxerWrapper so its ~3MB mediabunny static import doesn't
 // drag into recorder.bundle.js cold start (dominates click-record latency).
@@ -112,6 +114,23 @@ export class WebCodecsRecorder {
     this.audioSampleRate = null;
     this.audioChannelCount = null;
     this._firstAudioFrameSampleRate = null;
+    // µs written before the last stamp-rate change (folded in encodeAudioData).
+    this._audioTimeBaseUs = 0;
+    this._audioStampRate = null;
+    // Wall-clock reconciliation state. See reconcileAudioClock in readAudioLoop.
+    this._audioClockAnchorUs = null;
+    this._audioDriftWindowStartUs = null;
+    this._audioDriftWindowMinUs = Infinity;
+    this._injectedCatchUpSilenceEvents = 0;
+    this._injectedCatchUpSilenceUs = 0;
+    this._injectedCatchUpSettleUs = 0;
+    // Heartbeat audioDiag counters. See getAudioDiag.
+    this._audioDataReceived = 0;
+    this._audioDataEncoded = 0;
+    this._audioReceivedUs = 0;
+    this._paddedSilenceCount = 0;
+    this._audioClockAnchorInitialUs = null;
+    this._lastAudioLagUs = null;
 
     this.resizeCanvas = null;
     this.resizeCtx = null;
@@ -229,11 +248,11 @@ export class WebCodecsRecorder {
     this._adoptedDecoderConfig = null;
     this._forceNextKeyframe = false;
     this._droppedForBackpressureCount = 0;
-    // Audio: same pattern, deeper queue. Frames are smaller / more
-    // frequent (~10-25ms vs 33ms video at 30fps).
+    // 100, not 10. At ~10-25ms per chunk, 10 was ~100-200ms of headroom against
+    // video's ~530ms, so any hiccup past ~200ms destroyed audio. ~1s, under 500KB.
     this._audioEncoderMaxQueueSize = Number.isFinite(options.audioEncoderMaxQueueSize)
       ? options.audioEncoderMaxQueueSize
-      : 10;
+      : 100;
     this._droppedAudioForBackpressureCount = 0;
     // Peak queue depth; leading indicator for backpressure tuning.
     // Drops tell us when the encoder failed; this tells us when it
@@ -453,6 +472,7 @@ export class WebCodecsRecorder {
     this._lastVideoReclaimRebuildAt = null;
     this._lastAudioReclaimRebuildAt = null;
     this._encodersClosedForPause = false;
+    this._finalizeRan = false;
     this._finalizeOnFatalRan = false;
     this._finalizingFromFatal = false;
     this._audioDeviceChangePending = false;
@@ -477,6 +497,20 @@ export class WebCodecsRecorder {
     this._frameDurationUs = null;
     this._lastKeyFrameIndex = 0;
     this.audioSamplesWritten = 0;
+    this._audioTimeBaseUs = 0;
+    this._audioStampRate = null;
+    this._audioClockAnchorUs = null;
+    this._audioDriftWindowStartUs = null;
+    this._audioDriftWindowMinUs = Infinity;
+    this._injectedCatchUpSilenceEvents = 0;
+    this._injectedCatchUpSilenceUs = 0;
+    this._injectedCatchUpSettleUs = 0;
+    this._audioDataReceived = 0;
+    this._audioDataEncoded = 0;
+    this._audioReceivedUs = 0;
+    this._paddedSilenceCount = 0;
+    this._audioClockAnchorInitialUs = null;
+    this._lastAudioLagUs = null;
 
     if (this.running) return this._startPromise;
 
@@ -524,12 +558,20 @@ export class WebCodecsRecorder {
         this.actualWidth = width;
         this.actualHeight = height;
 
+        // Oriented to the source so a portrait crop doesn't bind on height
+        // (see orientBoxToSource); the pixel-area cap below is the encoder limit.
+        const cap = orientBoxToSource(
+          width,
+          height,
+          this.options?.width,
+          this.options?.height,
+        );
         // Apply user/hard cap, even-rounding, and AVC pixel-area cap.
         const dimResult = computeAvcCappedDimensions({
           sourceWidth: width,
           sourceHeight: height,
-          userMaxWidth: this.options?.width,
-          userMaxHeight: this.options?.height,
+          userMaxWidth: cap.width,
+          userMaxHeight: cap.height,
         });
         if (dimResult.capped.area) {
           this.warn("[WCR] target clamped to AVC max pixel area", {
@@ -574,11 +616,14 @@ export class WebCodecsRecorder {
 
         let videoConfig = null;
         if (overrideConfig) {
-          const config = {
-            ...overrideConfig,
+          // Rate settings come from the caller, not the probe; an unsupported
+          // combination just falls through to chooseVideoEncoderConfig below.
+          const config = applyEncoderConfigOverrides(overrideConfig, {
             width: this.targetWidth,
             height: this.targetHeight,
-          };
+            bitrate: safeBitrate,
+            framerate: fps,
+          });
           this.log("[WCR] Using override encoder config", config);
           try {
             const support = await VideoEncoder.isConfigSupported(config);
@@ -813,11 +858,20 @@ export class WebCodecsRecorder {
     }
     this._stopping = true;
 
-    if (!this.running) {
-      this.log("[WCR] stop() called but recorder not running");
+    // Not `!running`: a source track ending (stopped screen share) clears it in
+    // readVideoLoop, and stop() then returned without flushing or finalizing.
+    if (this._finalizeRan || (!this.running && this.frameCount === 0)) {
+      this.log("[WCR] stop() called but nothing left to finalize", {
+        finalizeRan: this._finalizeRan,
+        running: this.running,
+        frameCount: this.frameCount,
+      });
       this._stopping = false;
       return;
     }
+    // Claim the finalize before any await so a second stop() (the fatal path
+    // calls this too) can't run it twice.
+    this._finalizeRan = true;
 
     if (this._startAlignTimer) {
       clearTimeout(this._startAlignTimer);
@@ -877,6 +931,15 @@ export class WebCodecsRecorder {
       endSpan({ ms });
     };
     try {
+      // E2E seam: stand in for a slow flush. Must sit after the loops have
+      // stopped, or the writer keeps appending and the file never goes static.
+      const forcedFinalizeDelayMs =
+        Number(
+          /** @type {any} */ (globalThis).__screenityForceFinalizeDelayMs,
+        ) || 0;
+      if (forcedFinalizeDelayMs > 0) {
+        await new Promise((r) => setTimeout(r, forcedFinalizeDelayMs));
+      }
       await flushBounded(this.videoEncoder, "video");
       await flushBounded(this.audioEncoder, "audio");
     } catch (err) {
@@ -895,11 +958,7 @@ export class WebCodecsRecorder {
       this._frameDurationUs
     ) {
       try {
-        const sampleRate = this.audioSampleRate || 48000;
-        const audioEndUs =
-          this.audioSamplesWritten > 0
-            ? Math.round((this.audioSamplesWritten * 1_000_000) / sampleRate)
-            : 0;
+        const audioEndUs = this._audioWrittenUs();
         const holdStartUs = this._videoFrameIndex * this._frameDurationUs;
         // Cushion for audio drain lag + muxer rounding; 150ms is imperceptible.
         const cushionUs = 150_000;
@@ -1150,6 +1209,17 @@ export class WebCodecsRecorder {
       droppedForBackpressureVideo: this._droppedForBackpressureCount ?? null,
       droppedForBackpressureAudio:
         this._droppedAudioForBackpressureCount ?? null,
+      // Steady-state catch-up silence after upstream AudioData loss.
+      // Nonzero = this recording would have drifted without reconciliation.
+      injectedCatchUpSilenceMs: Math.round(
+        (this._injectedCatchUpSilenceUs || 0) / 1000,
+      ),
+      injectedCatchUpSilenceEvents: this._injectedCatchUpSilenceEvents ?? 0,
+      // First 10s only. 0-150ms of settle jank is normal on healthy
+      // sessions, so it stays out of the alarm signal above.
+      injectedCatchUpSettleMs: Math.round(
+        (this._injectedCatchUpSettleUs || 0) / 1000,
+      ),
       // Submissions to encode(), not muxer output (that's chunksOut).
       framesEncoded: this.frameCount ?? null,
       chunksOut: this._chunksOut ?? null,
@@ -1160,6 +1230,45 @@ export class WebCodecsRecorder {
       startupBufferEngaged: this._startupBufferEngaged ?? null,
       framesBufferedAtStart: this._framesBufferedAtStart ?? null,
       adoptedWarmEncoder: this._adoptedPrewarmEncoder === true,
+    };
+  }
+
+  // Audio mirror of screenDiag's framesFed/framesFromMSTP. audioLagMs is signed
+  // vs the first-packet epoch: growing positive = drift bug, negative = benign.
+  getAudioDiag() {
+    if (
+      !this.audioTrack &&
+      this._audioDataReceived === 0 &&
+      this._audioDataEncoded === 0
+    ) {
+      return null;
+    }
+    let lagMs = null;
+    if (this.running && this._audioClockAnchorInitialUs != null) {
+      let pausedUs = this.totalPausedDurationUs || 0;
+      if (this.paused && this.pauseStartUs != null) {
+        pausedUs += performance.now() * 1000 - this.pauseStartUs;
+      }
+      lagMs = Math.round(
+        (performance.now() * 1000 -
+          pausedUs -
+          this._audioClockAnchorInitialUs -
+          this._audioWrittenUs()) /
+          1000,
+      );
+    } else if (this._lastAudioLagUs != null) {
+      lagMs = Math.round(this._lastAudioLagUs / 1000);
+    }
+    return {
+      audioDataReceived: this._audioDataReceived,
+      audioDataEncoded: this._audioDataEncoded,
+      // Real delivered audio only (no pads, no catch-up silence). Against
+      // audioCtxTimeMs it places loss before or after the mix bus.
+      audioReceivedMs: Math.round(this._audioReceivedUs / 1000),
+      audioWrittenMs: Math.round(this._audioWrittenUs() / 1000),
+      audioLagMs: lagMs,
+      paddedSilenceCount: this._paddedSilenceCount,
+      droppedAudioForBackpressure: this._droppedAudioForBackpressureCount,
     };
   }
 
@@ -1180,6 +1289,10 @@ export class WebCodecsRecorder {
       frameRateActual: this._frameRateActual,
       frameWidthActual: this._frameWidthActual,
       frameHeightActual: this._frameHeightActual,
+      // What we actually encoded, after the cap and resize canvas; the source
+      // dims above are what arrived, these are what any pixel math must use.
+      encodeWidth: this.targetWidth ?? null,
+      encodeHeight: this.targetHeight ?? null,
       framesFed: this._framesFed,
       chunksOut: this._chunksOut,
       framesFromMSTP: this._framesFromMSTP,
@@ -1358,10 +1471,18 @@ export class WebCodecsRecorder {
     this._videoStartUs = null;
     this._frameDurationUs = null;
     this._lastKeyFrameIndex = 0;
+    // Fold before zeroing keeps audioWrittenMs readable post-stop. The nulled
+    // anchor below makes getAudioDiag fall back to the last in-loop lag.
+    this._audioTimeBaseUs = this._audioWrittenUs();
     this.audioSamplesWritten = 0;
     this.audioSampleRate = null;
     this.audioChannelCount = null;
     this._firstAudioFrameSampleRate = null;
+    this._audioStampRate = null;
+    this._audioClockAnchorUs = null;
+    this._audioClockAnchorInitialUs = null;
+    this._audioDriftWindowStartUs = null;
+    this._audioDriftWindowMinUs = Infinity;
 
     this.resizeCanvas = null;
     this.resizeCtx = null;
@@ -2485,7 +2606,10 @@ export class WebCodecsRecorder {
 
     const settings = this.audioTrack.getSettings();
     const sampleRate = settings.sampleRate || 48000;
-    const numberOfChannels = settings.channelCount || 2;
+    // options.audioChannels wins: getSettings() reports 2 while the node mixes
+    // mono (measured), and a stereo encoder rejects mono AudioData.
+    const numberOfChannels =
+      this.options.audioChannels || settings.channelCount || 2;
 
     try {
       chrome.storage.local.set({
@@ -2803,6 +2927,12 @@ export class WebCodecsRecorder {
             this._staticFrameSyntheticCount += 1;
           }
         } else {
+          // E2E seam: exit the loop as if the source track ended, which is what
+          // stopping the screen share does.
+          if (/** @type {any} */ (globalThis).__screenityForceVideoTrackEnd) {
+            try { readResult.value?.close?.(); } catch {}
+            break;
+          }
           if (readResult.done || !readResult.value) break;
           frame = readResult.value;
           this._framesFromMSTP += 1;
@@ -3066,6 +3196,14 @@ export class WebCodecsRecorder {
     }
   }
 
+  _audioWrittenUs() {
+    const rate = this._audioStampRate || this.audioSampleRate || 48000;
+    return (
+      this._audioTimeBaseUs +
+      Math.round((this.audioSamplesWritten * 1_000_000) / rate)
+    );
+  }
+
   async readAudioLoop() {
     while (this.paused && this.running) {
       await new Promise((r) => setTimeout(r, 10));
@@ -3073,7 +3211,7 @@ export class WebCodecsRecorder {
     if (!this.audioReader) return;
     this.log("[WCR] audio loop start");
 
-    const encodeAudioData = (audioData) => {
+    const encodeAudioData = (audioData, isCatchUpSilence = false) => {
       // E2E hook: override the perceived rate for one frame to drive
       // mismatch-rebuild in tests. Timestamps still use the real rate.
       const _g = /** @type {any} */ (globalThis);
@@ -3172,9 +3310,23 @@ export class WebCodecsRecorder {
         typeof audioData.numberOfFrames === "number"
           ? audioData.numberOfFrames
           : 0;
-      const tsUs = Math.round(
-        (this.audioSamplesWritten * 1_000_000) / sampleRate
-      );
+
+      // Stamp rate changed (mic switch): fold the counter at the OLD rate
+      // first, else the whole past timeline gets rescaled to the new one.
+      if (this._audioStampRate && sampleRate !== this._audioStampRate) {
+        this._audioTimeBaseUs += Math.round(
+          (this.audioSamplesWritten * 1_000_000) / this._audioStampRate,
+        );
+        this.audioSamplesWritten = 0;
+      }
+      this._audioStampRate = sampleRate;
+
+      // Before stamping, so injected catch-up silence lands ahead of this packet.
+      if (!isCatchUpSilence) {
+        reconcileAudioClock(sampleRate, frames);
+      }
+
+      const tsUs = this._audioWrittenUs();
       const durUs = Math.round((frames * 1_000_000) / sampleRate);
 
       // Track peak audio encode-queue depth (leading indicator).
@@ -3183,13 +3335,23 @@ export class WebCodecsRecorder {
         this._peakAudioEncodeQueueSize = aQueueSize;
       }
 
-      // Backpressure mirror of the video path. Advance the sample
-      // counter even on a drop so subsequent timestamps stay aligned
-      // (brief silence gap, beats audio drifting out of sync).
-      if (aQueueSize > this._audioEncoderMaxQueueSize) {
+      // E2E seam: force the real backpressure branch for N ms of audio, the
+      // encoder-side counterpart to __screenityForceAudioDrop above.
+      const forcedBpMs =
+        Number(
+          /** @type {any} */ (globalThis).__screenityForceAudioBackpressure,
+        ) || 0;
+      if (forcedBpMs > 0 && !isCatchUpSilence) {
+        /** @type {any} */ (globalThis).__screenityForceAudioBackpressure =
+          Math.max(0, forcedBpMs - (frames * 1000) / sampleRate);
+      }
+
+      // The muxer builds the audio timeline from encoded durations, so a drop
+      // shifts later audio earlier. Leave the counter for the reconciler.
+      if (forcedBpMs > 0 || aQueueSize > this._audioEncoderMaxQueueSize) {
+        if (isCatchUpSilence) return false;
         this._droppedAudioForBackpressureCount += 1;
-        this.audioSamplesWritten += frames;
-        return;
+        return false;
       }
 
       try {
@@ -3197,19 +3359,18 @@ export class WebCodecsRecorder {
           timestamp: tsUs,
         });
       } catch (encErr) {
-        // Audio encode-queue overflow: drop as backpressure (mirrors video) and
-        // advance the sample counter so timestamps stay aligned.
         if (encErr?.name === "QuotaExceededError") {
+          if (isCatchUpSilence) return false;
           this._droppedAudioForBackpressureCount += 1;
-          this.audioSamplesWritten += frames;
           this.warn(
             "[WCR] audio encode() QuotaExceededError; dropping audio data",
           );
-          return;
+          return false;
         }
         throw encErr;
       }
       this.audioSamplesWritten += frames;
+      this._audioDataEncoded += 1;
 
       if (this.debug && (this.audioSamplesWritten === frames || this.audioSamplesWritten % (sampleRate * 10) < frames)) {
         this.log("[WCR] audio pts", {
@@ -3219,13 +3380,13 @@ export class WebCodecsRecorder {
           sampleRate,
         });
       }
+      return true;
     };
 
     // Windows WASAPI loopback stops yielding on silent system audio,
     // leaving audioReader.read() pending. Pad with silence.
     const SILENCE_TIMEOUT_MS = 500;
     const SILENCE_CHUNK_MS = 500;
-    let paddedSilenceCount = 0;
 
     const makeSilentAudioData = (durationMs) => {
       const sampleRate = this.audioSampleRate || 48000;
@@ -3240,11 +3401,126 @@ export class WebCodecsRecorder {
         sampleRate,
         numberOfFrames: frames,
         numberOfChannels: channels,
-        timestamp: Math.round(
-          (this.audioSamplesWritten * 1_000_000) / sampleRate,
-        ),
+        timestamp: this._audioWrittenUs(),
         data,
       });
+    };
+
+    // Lost AudioData (MSTP overflow under load) shortens the track with
+    // contiguous PTS, so everything after the loss plays early.
+    const AUDIO_DRIFT_WINDOW_US = 2_000_000;
+    const AUDIO_DRIFT_MIN_INJECT_US = 50_000;
+    // Injections this early are one-time settle jank, measured at 50-134ms
+    // within the first ~7s of healthy runs. Bucketed apart from the alarm.
+    const AUDIO_CATCHUP_SETTLE_WINDOW_US = 10_000_000;
+    // Caps one catch-up event at 60s (e.g. a wall-clock jump across system
+    // sleep). The remainder is picked up by the next window.
+    const MAX_CATCHUP_CHUNKS_PER_EVENT = 120;
+
+    const injectCatchUpSilence = (deficitUs) => {
+      const inSettleWindow =
+        this._audioWrittenUs() < AUDIO_CATCHUP_SETTLE_WINDOW_US;
+      let remainingUs = deficitUs;
+      let chunks = 0;
+      while (
+        remainingUs >= AUDIO_DRIFT_MIN_INJECT_US &&
+        chunks < MAX_CATCHUP_CHUNKS_PER_EVENT
+      ) {
+        chunks += 1;
+        const chunkMs = Math.min(SILENCE_CHUNK_MS, remainingUs / 1000);
+        const silent = makeSilentAudioData(chunkMs);
+        const silentUs = Math.round(
+          (silent.numberOfFrames * 1_000_000) / silent.sampleRate,
+        );
+        // No await here, so encodeQueueSize only grows and past the cap every
+        // chunk is refused. Stop and leave the residual for the next window.
+        let encoded = false;
+        try {
+          encoded = encodeAudioData(silent, true) === true;
+        } finally {
+          try { silent.close?.(); } catch {}
+        }
+        if (!encoded) break;
+        remainingUs -= silentUs;
+        if (inSettleWindow) {
+          this._injectedCatchUpSettleUs += silentUs;
+        } else {
+          this._injectedCatchUpSilenceUs += silentUs;
+        }
+      }
+      const injectedUs = deficitUs - remainingUs;
+      if (injectedUs <= 0) return 0;
+      if (!inSettleWindow) {
+        this._injectedCatchUpSilenceEvents += 1;
+      }
+      this.warn("[WCR] audio behind wall clock; injected catch-up silence", {
+        deficitMs: Math.round(deficitUs / 1000),
+        injectedMs: Math.round(injectedUs / 1000),
+        settle: inSettleWindow,
+        events: this._injectedCatchUpSilenceEvents,
+      });
+      try {
+        diagForward("recorder-audio-clock-reconciled", {
+          deficitMs: Math.round(deficitUs / 1000),
+          settle: inSettleWindow,
+          totalInjectedMs: Math.round(
+            (this._injectedCatchUpSilenceUs + this._injectedCatchUpSettleUs) /
+              1000,
+          ),
+          events: this._injectedCatchUpSilenceEvents,
+        });
+      } catch {}
+      return injectedUs;
+    };
+
+    // Anchor = global min of (elapsed - written), injection = windowed min lag.
+    // A windowed anchor hides accumulated loss, an unwindowed one pads mere delay.
+    const reconcileAudioClock = (sampleRate, incomingFrames) => {
+      // Pause cancels out: the counter freezes while paused and effNow
+      // subtracts the same span, so resume reads no deficit.
+      const effNowUs =
+        performance.now() * 1000 - (this.totalPausedDurationUs || 0);
+      // Counts the incoming packet: healthy delivery then reconciles to ~0 lag,
+      // so packet-arrival jitter never crosses the injection threshold.
+      const posUs =
+        this._audioWrittenUs() +
+        Math.round((incomingFrames * 1_000_000) / sampleRate);
+      const anchorCandidate = effNowUs - posUs;
+      if (
+        this._audioClockAnchorUs == null ||
+        anchorCandidate < this._audioClockAnchorUs
+      ) {
+        if (this._audioClockAnchorUs == null) {
+          this._audioClockAnchorInitialUs = anchorCandidate;
+        }
+        this._audioClockAnchorUs = anchorCandidate;
+      }
+      const lagUs = effNowUs - this._audioClockAnchorUs - posUs;
+      // Diagnostic only, against the fixed first-packet epoch. The ratcheting
+      // anchor above clamps to >= 0 and would hide audio running ahead.
+      this._lastAudioLagUs =
+        effNowUs - this._audioClockAnchorInitialUs - posUs;
+
+      if (this._audioDriftWindowStartUs == null) {
+        this._audioDriftWindowStartUs = effNowUs;
+        this._audioDriftWindowMinUs = lagUs;
+        return;
+      }
+      if (lagUs < this._audioDriftWindowMinUs) {
+        this._audioDriftWindowMinUs = lagUs;
+      }
+      if (effNowUs - this._audioDriftWindowStartUs < AUDIO_DRIFT_WINDOW_US) {
+        return;
+      }
+      const deficitUs = this._audioDriftWindowMinUs;
+      this._audioDriftWindowStartUs = effNowUs;
+      this._audioDriftWindowMinUs = lagUs;
+      if (deficitUs >= AUDIO_DRIFT_MIN_INJECT_US) {
+        const injectedUs = injectCatchUpSilence(deficitUs);
+        // Post-injection lag, not the stale pre-injection value, which
+        // would double-inject on a slow next packet.
+        this._audioDriftWindowMinUs = Math.max(0, lagUs - injectedUs);
+      }
     };
 
     try {
@@ -3291,11 +3567,14 @@ export class WebCodecsRecorder {
             } finally {
               silent.close?.();
             }
-            paddedSilenceCount += 1;
-            if (paddedSilenceCount === 1 || paddedSilenceCount % 20 === 0) {
+            this._paddedSilenceCount += 1;
+            if (
+              this._paddedSilenceCount === 1 ||
+              this._paddedSilenceCount % 20 === 0
+            ) {
               this.log(
                 "[WCR] audio source quiet, padding silence",
-                paddedSilenceCount,
+                this._paddedSilenceCount,
               );
             }
           } catch (err) {
@@ -3308,6 +3587,35 @@ export class WebCodecsRecorder {
 
         const { value: audioData, done } = readResult;
         if (done || !audioData) break;
+        // E2E seam: drop delivered AudioData (value = ms to drop) ahead of every
+        // counter, so it reads exactly like upstream MSTP loss.
+        const forcedDropMs =
+          Number(
+            /** @type {any} */ (globalThis).__screenityForceAudioDrop,
+          ) || 0;
+        if (forcedDropMs > 0 && audioData.sampleRate) {
+          const chunkMs =
+            ((audioData.numberOfFrames || 0) * 1000) / audioData.sampleRate;
+          /** @type {any} */ (globalThis).__screenityForceAudioDrop = Math.max(
+            0,
+            forcedDropMs - chunkMs,
+          );
+          audioData.close?.();
+          continue;
+        }
+        // Not while paused: the mic keeps delivering but those packets are
+        // dropped below, which read as heavy loss against audioDataEncoded.
+        if (!this.paused) {
+          this._audioDataReceived += 1;
+          if (
+            typeof audioData.numberOfFrames === "number" &&
+            audioData.sampleRate
+          ) {
+            this._audioReceivedUs += Math.round(
+              (audioData.numberOfFrames * 1_000_000) / audioData.sampleRate,
+            );
+          }
+        }
         if (!this.audioTrack || this.audioTrack.readyState === "ended") {
           this.warn("[WCR] audio lost");
           this.options.onError?.({ type: "audio-lost" });
@@ -3376,18 +3684,38 @@ export class WebCodecsRecorder {
       this.err("[WCR] audio loop error:", err);
     }
 
-    if (paddedSilenceCount > 0) {
+    if (
+      this._paddedSilenceCount > 0 ||
+      this._injectedCatchUpSilenceEvents > 0 ||
+      this._injectedCatchUpSettleUs > 0
+    ) {
       this.log(
-        "[WCR] audio loop exit, total silence chunks padded:",
-        paddedSilenceCount,
+        "[WCR] audio loop exit, silence chunks padded:",
+        this._paddedSilenceCount,
+        "catch-up ms:",
+        Math.round(
+          (this._injectedCatchUpSilenceUs + this._injectedCatchUpSettleUs) /
+            1000,
+        ),
       );
       try {
+        const paddedSilenceCount = this._paddedSilenceCount;
+        const catchUpSilenceMs = Math.round(
+          this._injectedCatchUpSilenceUs / 1000,
+        );
+        const catchUpSilenceEvents = this._injectedCatchUpSilenceEvents;
+        const catchUpSettleMs = Math.round(
+          this._injectedCatchUpSettleUs / 1000,
+        );
         chrome.storage.local.get(["lastRecordingAudioSnapshot"], (res) => {
           const prev = res?.lastRecordingAudioSnapshot || {};
           chrome.storage.local.set({
             lastRecordingAudioSnapshot: {
               ...prev,
               paddedSilenceCount,
+              catchUpSilenceMs,
+              catchUpSilenceEvents,
+              catchUpSettleMs,
             },
           });
         });

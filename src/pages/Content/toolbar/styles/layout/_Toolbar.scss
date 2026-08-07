@@ -41,8 +41,9 @@ iframe.screenity-iframe {
   justify-content: center;
   gap: 8px;
   z-index: 99999999999999;
+  // No backdrop-filter: the background is fully opaque, so it blurred nothing
+  // while still forcing a compositing layer and a backdrop sample per frame.
   background: rgba(240, 238, 238, 1);
-  backdrop-filter: blur(10px);
   padding-left: 8px;
   padding-right: 8px;
   padding-top: 6px;

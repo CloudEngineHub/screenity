@@ -80,7 +80,6 @@ iframe.screenity-iframe {
   gap: 8px;
   z-index: 99999999999999;
   background: rgb(240, 238, 238);
-  backdrop-filter: blur(10px);
   padding-left: 8px;
   padding-right: 8px;
   padding-top: 6px;
@@ -1570,7 +1569,6 @@ body.driver-active .OnboardingArrow {
   gap: 8px;
   z-index: 999999999;
   background: rgb(240, 238, 238);
-  backdrop-filter: blur(10px);
   padding-left: 8px;
   padding-right: 8px;
   padding-top: 6px;
@@ -4617,5 +4615,3 @@ button {
 .driver-popover.ScreenityOnboardingPopover {
   z-index: 2147483647 !important;
 }
-
-/*# sourceMappingURL=app.css.map */

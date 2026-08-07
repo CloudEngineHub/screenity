@@ -5,6 +5,7 @@ import { getUserMediaWithFallback } from "../utils/mediaDeviceFallback";
 import { startAudioStream as acquireMicStream } from "../utils/startAudioStream";
 import { shouldAcquireMicAtStart } from "../utils/micAcquisitionPolicy";
 import { attachAudioContextWatchdog } from "../utils/audioContextWatchdog";
+import { beginFinalizeHeartbeat } from "../utils/finalizeHeartbeat";
 import { acquireDisplayMediaWithFocusRetry } from "../utils/acquireDisplayMedia";
 import {
   startTabKeepalive,
@@ -68,7 +69,6 @@ function logRecordingSnapshot(label, data) {
   debug(`Recording snapshot: ${label}`, data);
 }
 
-
 const Recorder = () => {
   const isRestarting = useRef(false);
   const isDismissing = useRef(false);
@@ -101,6 +101,9 @@ const Recorder = () => {
 
   const aCtx = useRef(null);
   const destination = useRef(null);
+  // Only set when we force the bus to mono: getSettings() can report 2 while the
+  // node mixes mono. Null lets the encoder read the track.
+  const audioBusChannels = useRef(null);
   const audioInputSource = useRef(null);
   const audioOutputSource = useRef(null);
   const audioInputGain = useRef(null);
@@ -937,6 +940,7 @@ const Recorder = () => {
         probeResult?.details?.selectedVideoConfig || null;
       const containerKind =
         probeResult?.details?.containerKind === "webm" ? "webm" : "mp4";
+
       let recorderToken = 0;
       let codecFallbackTriggered = false;
       let webcodecsFallbackTriggered = false;
@@ -1128,6 +1132,7 @@ const Recorder = () => {
           fps,
           videoBitrate: videoBitsPerSecond,
           audioBitrate: hasAudioTrack ? audioBitsPerSecond : undefined,
+          audioChannels: audioBusChannels.current,
           enableAudio: hasAudioTrack,
           videoEncoderConfig: selectedVideoConfig,
           containerKind,
@@ -2023,10 +2028,19 @@ const Recorder = () => {
         useWebCodecs.current &&
         recorder.current instanceof WebCodecsRecorder
       ) {
+        // Keeps the editor's reader waiting through a long flush instead of
+        // reading a truncated file.
+        const stopFinalizeHeartbeat = beginFinalizeHeartbeat(
+          chunkBackendRef.current?.backend === "opfs"
+            ? chunkBackendRef.current?.fileName
+            : null,
+        );
         try {
           await updateFreeFinalizeStatus("finalizing", 20);
           await recorder.current.stop();
-        } catch {}
+        } catch {} finally {
+          stopFinalizeHeartbeat();
+        }
         await waitForDrain();
         recorder.current = null;
       } else {
@@ -2365,6 +2379,24 @@ const Recorder = () => {
       endMic({ hasMic: Boolean(micstream) });
 
       helperAudioStream.current = micstream;
+
+      // Mic-only: a stereo destination just duplicates a mono mic, halving effective
+      // bitrate. Must be set before any source connects.
+      audioBusChannels.current = null;
+      try {
+        const micTrackForBus =
+          helperAudioStream.current?.getAudioTracks?.()[0] || null;
+        const willMixSystemAudio =
+          helperVideoStream.current.getAudioTracks().length > 0;
+        if (
+          micTrackForBus &&
+          !willMixSystemAudio &&
+          micTrackForBus.getSettings?.()?.channelCount === 1
+        ) {
+          destination.current.channelCount = 1;
+          audioBusChannels.current = 1;
+        }
+      } catch {}
 
       if (
         helperAudioStream.current != null &&

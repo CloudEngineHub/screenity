@@ -22,6 +22,9 @@ export class WebCodecsTrackRecorder {
     this.videoBitsPerSecond =
       options.videoBitsPerSecond || 16_000_000;
     this.audioBitsPerSecond = options.audioBitsPerSecond || 128_000;
+    // getSettings() can report 2 channels while the bus mixes mono, and a stereo
+    // encoder rejects mono AudioData (see WebCodecsRecorder).
+    this.audioChannels = options.audioChannels || null;
     this.enableAudio = options.enableAudio !== false; // default true
     // Used by cloud's camera path on macOS to force a software h264
     // encoder, sidestepping VideoToolbox's per-process HW-slot serialization.
@@ -29,6 +32,7 @@ export class WebCodecsTrackRecorder {
     // Namespaces the decoderConfig sidecar so dual-track keys don't collide.
     this.trackKind = options.trackKind || "default";
     this.encodeStats = null;
+    this.audioDiag = null;
     // MediaRecorder-shape fields used by callers.
     this._state = "inactive";
     this.ondataavailable = null;
@@ -67,6 +71,14 @@ export class WebCodecsTrackRecorder {
       return this.encodeStats || this._recorder?.getEncodeStats?.() || null;
     } catch {
       return this.encodeStats || null;
+    }
+  }
+
+  getAudioDiag() {
+    try {
+      return this.audioDiag || this._recorder?.getAudioDiag?.() || null;
+    } catch {
+      return this.audioDiag || null;
     }
   }
 
@@ -113,6 +125,9 @@ export class WebCodecsTrackRecorder {
       // encodeStats: null.
       try {
         this.encodeStats = this._recorder?.getEncodeStats?.() || null;
+      } catch {}
+      try {
+        this.audioDiag = this._recorder?.getAudioDiag?.() || null;
       } catch {}
       if (this._finalizedResolved) return;
       this._finalizedResolved = true;
@@ -176,6 +191,7 @@ export class WebCodecsTrackRecorder {
       enableAudio: this.enableAudio,
       videoBitrate: this.videoBitsPerSecond,
       audioBitrate: this.audioBitsPerSecond,
+      audioChannels: this.audioChannels,
       preferSoftware: this.preferSoftware,
       // Cap at 1080p; retina captures exceed AVC L4.2 (~2.2MP) and
       // throw on first frame, leaving Bunny with the 28-byte init.

@@ -86,6 +86,9 @@ const CursorModes = () => {
   // on modern trackpads.
   const stateRafRef = useRef(null);
   const scheduleCursorUpdate = () => {
+    // With no effect active the callback below does nothing, and we're injected on
+    // every page, so skip the rAF rather than schedule an empty frame per move.
+    if (effectsRef.current.size === 0) return;
     if (stateRafRef.current !== null) return;
     stateRafRef.current = requestAnimationFrame(() => {
       stateRafRef.current = null;

@@ -122,6 +122,10 @@ console.log("Verifying build/ for secret leaks...");
 sh("node scripts/verify-no-secrets.mjs");
 console.log("");
 
+console.log("Verifying build/ has no dev-server references...");
+sh("node scripts/assert-no-dev-env.mjs");
+console.log("");
+
 console.log("Creating build.zip...");
 try {
   sh("rm -f build.zip");

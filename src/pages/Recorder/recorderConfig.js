@@ -42,3 +42,50 @@ export const VIDEO_QUALITIES = {
 export function getResolutionForQuality(qualityValue = "default") {
   return VIDEO_QUALITIES[qualityValue] || VIDEO_QUALITIES.default;
 }
+
+// bits/pixel/sec. 0.10 put 1080p30 at 6.2 Mbps, under the 0.15-0.25 screen
+// content wants, and text edges are the first thing H.264 discards.
+export const VIDEO_BPP_FPS_PRO = 0.15;
+export const VIDEO_BPP_FPS_FREE = 0.08;
+export const VIDEO_BPS_MIN = 4_000_000;
+export const VIDEO_BPS_MAX = 24_000_000;
+
+export function computeTargetVideoBps(width, height, fps, isPro = false) {
+  const pixels = Number(width) * Number(height);
+  const rate = Number.isFinite(fps) && fps > 0 ? fps : 30;
+  const factor = isPro ? VIDEO_BPP_FPS_PRO : VIDEO_BPP_FPS_FREE;
+  const target = Math.round(pixels * rate * factor);
+  return Math.max(VIDEO_BPS_MIN, Math.min(VIDEO_BPS_MAX, target));
+}
+
+export async function getFreeCaptureCaps() {
+  try {
+    const { isLoggedIn, isSubscribed } = await chrome.storage.local.get([
+      "isLoggedIn",
+      "isSubscribed",
+    ]);
+    return {
+      isPro: Boolean(isLoggedIn && isSubscribed),
+      maxQuality: "1080p",
+      maxFps: 60,
+    };
+  } catch {
+    return { isPro: false, maxQuality: "1080p", maxFps: 60 };
+  }
+}
+
+// Every encode cap we ship is landscape, so a portrait source binds on HEIGHT
+// and collapses the width (412x924 encoded to 482x1080). Orient the box to the
+// source first so a cap means pixels on the long edge, not a shape.
+export function orientBoxToSource(sourceWidth, sourceHeight, boxWidth, boxHeight) {
+  const sw = Number(sourceWidth);
+  const sh = Number(sourceHeight);
+  const bw = Number(boxWidth);
+  const bh = Number(boxHeight);
+  if (![sw, sh, bw, bh].every((n) => Number.isFinite(n) && n > 0)) {
+    return { width: boxWidth, height: boxHeight };
+  }
+  return sh > sw === bh > bw
+    ? { width: bw, height: bh }
+    : { width: bh, height: bw };
+}

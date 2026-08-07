@@ -20,7 +20,20 @@ export const setupHandlers = () => {
   let lastToggleDrawingAt = 0;
   const TOGGLE_DRAWING_COOLDOWN_MS = 400;
   let projectReadySeq = 0;
+  // Only bounds the fallback runtime copy. The bridge has no size limit.
   const LOCAL_PLAYBACK_MAX_BYTES = 250 * 1024 * 1024;
+  const BRIDGE_READY = "screenity-local-playback-bridge-ready";
+  const BRIDGE_REQUEST = "screenity-local-playback-bridge-request";
+  const BRIDGE_RESULT = "screenity-local-playback-bridge-result";
+  const BRIDGE_ORIGIN = (() => {
+    try {
+      return new URL(chrome.runtime.getURL("")).origin;
+    } catch {
+      return null;
+    }
+  })();
+  const BRIDGE_READY_TIMEOUT_MS = 5000;
+  const BRIDGE_BUILD_TIMEOUT_MS = 120000;
   let latestLocalPlaybackOffer = null;
   let latestLocalPlaybackProjectId = null;
   let latestLocalPlaybackSceneId = null;
@@ -102,29 +115,110 @@ export const setupHandlers = () => {
     } catch {}
   };
 
-  const fetchLocalPlaybackSourceFromExtension = async ({
-    offerId,
-    projectId,
-    sceneId,
-  }) => {
-    const offerRes = await chrome.runtime.sendMessage({
-      type: "cloud-local-playback-get-offer",
-      offerId,
-      projectId,
-      sceneId,
-    });
-    if (!offerRes?.ok || !offerRes.offer) {
-      throw new Error("local-playback-offer-unavailable");
+  // Preferred path: extension-origin iframe posts one Blob back by reference,
+  // O(1) in recording size. The base64 loop below copies every byte and is
+  // capped at LOCAL_PLAYBACK_MAX_BYTES.
+  let bridgeFrame = null;
+  let bridgeReady = null;
+  const bridgePending = new Map();
+
+  const ensureBridgeFrame = () => {
+    // Bridge only talks to the trusted app origin; fail fast into the runtime
+    // fallback instead of waiting out the ready timeout.
+    if (!BRIDGE_ORIGIN || !getProjectMessageTargetOrigin()) {
+      return Promise.reject(new Error("local-playback-bridge-untrusted-origin"));
     }
-    const offer = offerRes.offer;
+    if (bridgeReady) return bridgeReady;
+    bridgeReady = new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error("local-playback-bridge-timeout"));
+      }, BRIDGE_READY_TIMEOUT_MS);
+
+      const onReady = (event) => {
+        if (event.source !== bridgeFrame?.contentWindow) return;
+        if (event.data?.source !== BRIDGE_READY) return;
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        window.removeEventListener("message", onReady);
+        resolve(bridgeFrame);
+      };
+      window.addEventListener("message", onReady);
+
+      try {
+        bridgeFrame = document.createElement("iframe");
+        bridgeFrame.src = chrome.runtime.getURL("localplaybackbridge.html");
+        bridgeFrame.setAttribute("aria-hidden", "true");
+        bridgeFrame.style.cssText =
+          "position:fixed;width:0;height:0;border:0;opacity:0;pointer-events:none;left:-9999px;";
+        (document.body || document.documentElement).appendChild(bridgeFrame);
+      } catch (err) {
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    }).catch((err) => {
+      // Let a later attempt rebuild the frame rather than caching the failure.
+      bridgeReady = null;
+      teardownBridgeFrame();
+      throw err;
+    });
+    return bridgeReady;
+  };
+
+  const teardownBridgeFrame = () => {
+    try {
+      bridgeFrame?.remove();
+    } catch {}
+    bridgeFrame = null;
+  };
+
+  const onBridgeMessage = (event) => {
+    if (!bridgeFrame || event.source !== bridgeFrame.contentWindow) return;
+    if (event.data?.source !== BRIDGE_RESULT) return;
+    const pending = bridgePending.get(event.data.requestId);
+    if (!pending) return;
+    bridgePending.delete(event.data.requestId);
+    pending(event.data);
+  };
+  window.addEventListener("message", onBridgeMessage);
+
+  const fetchLocalPlaybackBlobViaBridge = async (offer) => {
+    const frame = await ensureBridgeFrame();
+    const requestId = `${offer.offerId}:${Date.now()}`;
+    const reply = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        bridgePending.delete(requestId);
+        reject(new Error("local-playback-bridge-build-timeout"));
+      }, BRIDGE_BUILD_TIMEOUT_MS);
+      bridgePending.set(requestId, (data) => {
+        clearTimeout(timer);
+        resolve(data);
+      });
+      frame.contentWindow.postMessage(
+        { source: BRIDGE_REQUEST, requestId, offer },
+        BRIDGE_ORIGIN,
+      );
+    });
+
+    if (!reply?.ok || !(reply.blob instanceof Blob)) {
+      throw new Error(reply?.error || "local-playback-bridge-no-blob");
+    }
+    return reply;
+  };
+
+  // Fallback for anything the bridge can't serve (frame blocked by page CSP, storage
+  // unreachable). Same output shape, but copies every byte and only works below the cap.
+  const fetchLocalPlaybackBlobViaRuntime = async (offer) => {
     if (
-      !offer.chunkCount ||
       !offer.estimatedBytes ||
       offer.estimatedBytes > LOCAL_PLAYBACK_MAX_BYTES
     ) {
       throw new Error("local-playback-offer-too-large-or-empty");
     }
-
     const parts = [];
     for (let i = 0; i < offer.chunkCount; i += 1) {
       // eslint-disable-next-line no-await-in-loop
@@ -146,17 +240,52 @@ export const setupHandlers = () => {
       const mimeType = chunkRes.chunk.mimeType || "video/webm";
       parts.push(new Blob([bytes], { type: mimeType }));
     }
+    const blob = new Blob(parts, { type: parts[0]?.type || "video/webm" });
+    return { blob, size: blob.size, mimeType: blob.type };
+  };
 
-    const blob = new Blob(parts, {
-      type: parts[0]?.type || "video/webm",
+  const fetchLocalPlaybackSourceFromExtension = async ({
+    offerId,
+    projectId,
+    sceneId,
+  }) => {
+    const offerRes = await chrome.runtime.sendMessage({
+      type: "cloud-local-playback-get-offer",
+      offerId,
+      projectId,
+      sceneId,
     });
+    if (!offerRes?.ok || !offerRes.offer) {
+      throw new Error("local-playback-offer-unavailable");
+    }
+    const offer = offerRes.offer;
+    if (!offer.chunkCount || !offer.estimatedBytes) {
+      throw new Error("local-playback-offer-empty");
+    }
+
+    let transport = "bridge";
+    let built;
+    try {
+      built = await fetchLocalPlaybackBlobViaBridge(offer);
+    } catch (bridgeErr) {
+      console.warn(
+        "[Screenity][Content] Local playback bridge unavailable, falling back to runtime copy",
+        { offerId: offer.offerId, error: bridgeErr?.message || bridgeErr },
+      );
+      transport = "runtime";
+      built = await fetchLocalPlaybackBlobViaRuntime(offer);
+    }
+
+    const blob = built.blob;
     const url = URL.createObjectURL(blob);
     return {
       offer,
       url,
+      blob,
+      transport,
       size: blob.size || 0,
       mimeType: blob.type || "video/webm",
-      chunkCount: parts.length,
+      chunkCount: offer.chunkCount,
     };
   };
 
@@ -206,6 +335,8 @@ export const setupHandlers = () => {
           projectId: source.offer.projectId || null,
           sceneId: source.offer.sceneId || null,
           usedBy: "app-editor",
+          localBytes: source.size || 0,
+          transport: source.transport || null,
         });
       } catch {}
 
@@ -241,6 +372,11 @@ export const setupHandlers = () => {
         offerId: offer?.offerId || null,
         chunkCount: offer?.chunkCount || 0,
         estimatedBytes: offer?.estimatedBytes || 0,
+        // Local source covers only the opening of the recording, so the editor
+        // swaps to the remote URL once that exists.
+        partial: Boolean(offer?.partial),
+        availableBytes: offer?.availableBytes || offer?.estimatedBytes || 0,
+        totalBytes: offer?.totalBytes || null,
         expiresAt: offer?.expiresAt || null,
         source: offer?.source || "indexeddb-screen-chunks",
         ready: Boolean(readySource?.url),
@@ -333,6 +469,9 @@ export const setupHandlers = () => {
             localBytes: readySource?.size || null,
             chunkCount: offer.chunkCount || 0,
             estimatedBytes: offer.estimatedBytes || 0,
+            partial: Boolean(offer.partial),
+            availableBytes: offer.availableBytes || offer.estimatedBytes || 0,
+            totalBytes: offer.totalBytes || null,
             expiresAt: offer.expiresAt || null,
             source: offer.source || "indexeddb-screen-chunks",
           },
@@ -1171,6 +1310,12 @@ export const setupHandlers = () => {
         localBytes: activeLocalPlaybackSource.size || null,
         chunkCount: latestLocalPlaybackOffer.chunkCount || 0,
         estimatedBytes: latestLocalPlaybackOffer.estimatedBytes || 0,
+        partial: Boolean(latestLocalPlaybackOffer.partial),
+        availableBytes:
+          latestLocalPlaybackOffer.availableBytes ||
+          latestLocalPlaybackOffer.estimatedBytes ||
+          0,
+        totalBytes: latestLocalPlaybackOffer.totalBytes || null,
         expiresAt: latestLocalPlaybackOffer.expiresAt || null,
       };
     }

@@ -1,78 +1,49 @@
 // Fabric v5 → v6 shim. v6 dropped the `fabric` namespace export, so
 // this re-exports v6's named exports under the legacy `fabric.X` shape
-// our call sites use. Tree-shaking still works.
+// our call sites use.
+//
+// Only the names the canvas modules actually reference: webpack follows the
+// namespace object below, so re-exporting the rest of v6 "just in case" pinned
+// SVG parsing, image filters, and unused shape classes into the content bundle
+// that's injected into every page. Add a name back if a call site needs it.
 import {
   Canvas,
-  StaticCanvas,
-  ActiveSelection,
   Circle,
   Color,
   Control,
-  Ellipse,
   FabricImage,
   FabricObject,
-  FabricText,
-  Gradient,
   Group,
-  IText,
   Line,
   Path,
-  Pattern,
   PencilBrush,
-  Point,
-  Polygon,
-  Polyline,
   Rect,
-  Shadow,
   Textbox,
   Triangle,
-  classRegistry,
-  config,
   controlsUtils,
-  filters,
-  loadSVGFromString,
-  loadSVGFromURL,
   util,
-  version,
 } from "fabric";
 
 // v5-style namespace; only the classes used in src/pages/Content/canvas.
+// Undo/redo goes through canvas.loadFromJSON, which resolves serialized type
+// names via fabric's own class registry: classes register on import, so every
+// shape we can create is already covered by the imports above.
 export const fabric = {
   Canvas,
-  StaticCanvas,
-  ActiveSelection,
   Circle,
   Color,
   Control,
-  Ellipse,
-  Image: FabricImage,
-  FabricImage,
-  Object: FabricObject,
-  FabricObject,
-  Text: FabricText,
-  FabricText,
-  Gradient,
   Group,
-  IText,
+  Image: FabricImage,
   Line,
+  Object: FabricObject,
   Path,
-  Pattern,
   PencilBrush,
-  Point,
-  Polygon,
-  Polyline,
   Rect,
-  Shadow,
   Textbox,
   Triangle,
-  classRegistry,
-  config,
   controlsUtils,
-  filters,
-  loadSVGFromString,
-  loadSVGFromURL,
   util,
-  version,
 };
 
 export default fabric;

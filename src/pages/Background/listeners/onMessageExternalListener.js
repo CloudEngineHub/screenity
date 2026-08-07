@@ -34,11 +34,23 @@ export const onMessageExternalListener = () => {
           showProSplash: false,
         });
         // otherwise the drain listener clobbers this fresh token on next recording-end
-        await chrome.storage.local.remove(["logoutPendingTokenClear"]);
+        await chrome.storage.local.remove([
+          "logoutPendingTokenClear",
+          "loginPendingAt",
+          "loginTabId",
+        ]);
+
+        // loginWithWebsite() consumes and clears originalTabId, so read it first
+        // or the close below is unreachable and every login leaks its tab.
+        const { originalTabId: loginOpenedFromTabId } =
+          await chrome.storage.local.get("originalTabId");
 
         const auth = await loginWithWebsite();
 
         if (!auth?.authenticated) {
+          console.warn(
+            "[Screenity][Auth] AUTH_SUCCESS token did not verify, staying logged out",
+          );
           await chrome.storage.local.set({
             isLoggedIn: false,
           });
@@ -56,24 +68,12 @@ export const onMessageExternalListener = () => {
           lastAuthCheck: Date.now(),
         });
 
-        const { originalTabId } = await chrome.storage.local.get(
-          "originalTabId"
-        );
-
-        if (originalTabId) {
-          chrome.tabs.update(originalTabId, { active: true });
-          sendMessageTab(originalTabId, { type: "LOGIN_SUCCESS" });
-
-          if (sender.tab?.id) {
-            chrome.tabs.remove(sender.tab.id);
-          }
-
-          await chrome.storage.local.remove("originalTabId");
-
-          sendMessageTab(originalTabId, {
-            type: "check-auth",
-            senderId: sender.tab.id,
-          });
+        // loginWithWebsite does the refocus, but only this scope knows the
+        // sender, so the close lives here. Gated so a hand-opened /login stays put.
+        if (loginOpenedFromTabId && sender.tab?.id) {
+          try {
+            await chrome.tabs.remove(sender.tab.id);
+          } catch {}
         }
 
         return true;

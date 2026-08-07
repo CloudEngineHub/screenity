@@ -5,6 +5,7 @@ import {
   sendStopRecording,
 } from "../utils/recorderMessaging";
 import { getBitrates, getResolutionForQuality } from "./recorderConfig";
+import { pickEncodedDims, scaleClickEvents } from "./encodedDims";
 import BunnyTusUploader from "./bunnyTusUploader";
 import localforage from "localforage";
 import { createVideoProject } from "./createVideoProject";
@@ -50,6 +51,16 @@ import {
   enforceOversampleRatio,
 } from "../utils/captureResolution";
 import { getCompressedLifecycleLog } from "../utils/lifecycleLog";
+import {
+  CHUNK_PURGE_COMFORT_HEADROOM_BYTES,
+  resolvePrefixBudget,
+  resolvePurgeMode,
+  emptyRetainedPrefix,
+  extendRetainedPrefix,
+  selectChunksToPurge,
+  selectPrefixChunksToDrop,
+  resolveLocalPlaybackPlan,
+} from "./localPlaybackRetention";
 
 localforage.config({
   driver: localforage.INDEXEDDB,
@@ -75,7 +86,9 @@ const STORAGE_LOW_HEADROOM_BYTES = 250 * 1024 * 1024;
 const STORAGE_CRITICAL_HEADROOM_BYTES = 120 * 1024 * 1024;
 const AUDIO_MAX_BUFFER_BYTES = 150 * 1024 * 1024;
 const LOCAL_SCREEN_PLAYBACK_TTL_MS = 20 * 60 * 1000;
-const LOCAL_SCREEN_PLAYBACK_MAX_BYTES = 250 * 1024 * 1024;
+// The old 250MB was the base64 transport limit, not a storage or playback bound.
+// The bridge passes a Blob by reference now, so headroom governs and this is a backstop.
+const LOCAL_SCREEN_PLAYBACK_MAX_BYTES = 8 * 1024 * 1024 * 1024;
 // Bytes kept past lastServerOffset before purging - covers in-flight PATCHes, HEAD resyncs, 409 retries.
 const CHUNK_PURGE_SAFETY_WINDOW_BYTES = 32 * 1024 * 1024;
 const MAX_UPLOAD_TELEMETRY_EVENTS = 300;
@@ -233,6 +246,9 @@ const CloudRecorder = () => {
 
   const audioInputGain = useRef(null);
   const audioOutputGain = useRef(null);
+  // Set only when we force the bus to mono, since getSettings() can report 2
+  // while mixing mono. Null lets the encoder read the track it actually encodes.
+  const audioBusChannels = useRef(null);
 
   const uploadersInitialized = useRef(false);
   const pendingStartRef = useRef(false);
@@ -304,6 +320,21 @@ const CloudRecorder = () => {
   const screenChunksPurgedCountRef = useRef(0);
   const cameraChunksPurgedCountRef = useRef(0);
   const chunksPurgedBytesRef = useRef(0);
+  // A healthy OPFS write is a few ms. Sustained spikes while the page lags is
+  // the local-disk-contention signature.
+  const localWriteStatsRef = useRef({
+    count: 0,
+    totalMs: 0,
+    maxMs: 0,
+    slowCount: 0,
+  });
+  // Leading screen chunks [0, chunks) still on disk. `dropped` is sticky so a
+  // hole can never be reported as a contiguous prefix.
+  const screenRetainedPrefixRef = useRef(emptyRetainedPrefix());
+  const purgeModeRef = useRef("none");
+  // purgeConfirmedChunks runs un-awaited per chunk write. Overlapping passes
+  // would both consume ranges, leaving live chunks untracked and never deleted.
+  const purgeInFlightRef = useRef({ screen: false, camera: false });
   const sessionStateIndexedRef = useRef(false);
   const sessionHeartbeat = useRef(null);
   const chunkStallTimer = useRef(null);
@@ -386,6 +417,9 @@ const CloudRecorder = () => {
   const isInit = useRef(false);
 
   const aCtx = useRef(null);
+  // audioCtxWallMs minus audioCtxTimeMs growing = the mix bus underran
+  // (samples never rendered, the drift source).
+  const aCtxCreatedAtRef = useRef(null);
   // Live AudioContext interruption stats from attachAudioContextWatchdog,
   // folded into the audio diag snapshot at finalize for upload telemetry.
   const audioHealthRef = useRef(null);
@@ -728,6 +762,31 @@ const CloudRecorder = () => {
             : typeof eventPayload.finalizedBytes === "number"
             ? eventPayload.finalizedBytes
             : null,
+        // The heartbeat schema reads totalBytes, the fileSize mapping above
+        // serves the upload events.
+        totalBytes:
+          typeof eventPayload.totalBytes === "number"
+            ? eventPayload.totalBytes
+            : null,
+        // Set on recording_heartbeat. These existed in the server schema but
+        // no client path ever sent them.
+        availableBytes:
+          typeof eventPayload.availableBytes === "number"
+            ? eventPayload.availableBytes
+            : null,
+        localBytes:
+          typeof eventPayload.localBytes === "number"
+            ? eventPayload.localBytes
+            : null,
+        storageQuotaBytes:
+          typeof eventPayload.storageQuotaBytes === "number"
+            ? eventPayload.storageQuotaBytes
+            : null,
+        storageUsageBytes:
+          typeof eventPayload.storageUsageBytes === "number"
+            ? eventPayload.storageUsageBytes
+            : null,
+        localWriteStats: eventPayload.localWriteStats || null,
         online: typeof navigator !== "undefined" ? navigator.onLine : null,
         visibilityState:
           typeof document !== "undefined" ? document.visibilityState : null,
@@ -1629,6 +1688,83 @@ const CloudRecorder = () => {
     }
   };
 
+  const currentPrefixBudget = () =>
+    resolvePrefixBudget({
+      headroom: storagePressureRef.current.headroom,
+      transportCapBytes: LOCAL_SCREEN_PLAYBACK_MAX_BYTES,
+      comfortBytes: CHUNK_PURGE_COMFORT_HEADROOM_BYTES,
+      lowBytes: STORAGE_LOW_HEADROOM_BYTES,
+    });
+
+  const currentPurgeMode = () =>
+    resolvePurgeMode({
+      headroom: storagePressureRef.current.headroom,
+      lowBytes: STORAGE_LOW_HEADROOM_BYTES,
+    });
+
+  // chunk_0 stays: it's the init segment the crash-recovery and Download
+  // paths need. Unconfirmed chunks stay too, see selectPrefixChunksToDrop.
+  const dropRetainedPrefix = async (store, keyPrefix, uploader, rangesRef) => {
+    const prefix = screenRetainedPrefixRef.current;
+    const { drop, keptUnconfirmed } = selectPrefixChunksToDrop({
+      prefix,
+      lastServerOffset: Number(uploader?.lastServerOffset) || 0,
+      safetyWindowBytes: CHUNK_PURGE_SAFETY_WINDOW_BYTES,
+    });
+    // Stop offering local playback either way: the opening is about to be
+    // partly gone, so an offer built from it would not decode.
+    screenRetainedPrefixRef.current = {
+      chunks: 0,
+      bytes: 0,
+      dropped: true,
+      endBytes: [],
+    };
+    if (!drop.length) return;
+
+    const endBytes = prefix.endBytes || [];
+    let removed = 0;
+    let freedBytes = 0;
+    for (const i of drop) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await store.removeItem(`${keyPrefix}${i}`);
+      } catch (err) {
+        console.warn(
+          `[CloudRecorder] purge retained prefix chunk_${i} failed`,
+          err,
+        );
+        break;
+      }
+      removed += 1;
+      freedBytes += (endBytes[i] || 0) - (endBytes[i - 1] || 0);
+    }
+    if (removed > 0) {
+      // The trailing pass below still sees these entries otherwise and bills
+      // the same bytes a second time.
+      const dropped = new Set(drop.slice(0, removed));
+      const tracked = rangesRef?.current;
+      if (Array.isArray(tracked)) {
+        for (let i = tracked.length - 1; i >= 0; i -= 1) {
+          if (dropped.has(tracked[i]?.index)) tracked.splice(i, 1);
+        }
+      }
+      chunksPurgedDuringRecordingRef.current = true;
+      screenChunksPurgedCountRef.current += removed;
+      // Only what actually left disk, or the heartbeat reports reclaimed
+      // space that is still occupied.
+      chunksPurgedBytesRef.current += freedBytes;
+      console.info(
+        "[CloudRecorder] Dropped retained playback prefix under storage pressure",
+        {
+          removed,
+          freedBytes,
+          keptUnconfirmed,
+          headroom: storagePressureRef.current.headroom,
+        },
+      );
+    }
+  };
+
   // Purge IDB chunks Bunny has confirmed. chunk_0 (webm init segment) is preserved.
   const purgeConfirmedChunks = async (
     store,
@@ -1638,19 +1774,42 @@ const CloudRecorder = () => {
     trackLabel,
   ) => {
     if (!uploader || !rangesRef.current.length) return;
-    const lastServerOffset = Number(uploader.lastServerOffset) || 0;
-    if (lastServerOffset <= CHUNK_PURGE_SAFETY_WINDOW_BYTES) return;
-    const cutoff = lastServerOffset - CHUNK_PURGE_SAFETY_WINDOW_BYTES;
+    const mode = currentPurgeMode();
+    purgeModeRef.current = mode;
+    if (purgeInFlightRef.current[trackLabel]) return;
+    purgeInFlightRef.current[trackLabel] = true;
+    try {
+      await runPurgePass(store, rangesRef, uploader, keyPrefix, trackLabel, mode);
+    } finally {
+      purgeInFlightRef.current[trackLabel] = false;
+    }
+  };
+
+  const runPurgePass = async (
+    store,
+    rangesRef,
+    uploader,
+    keyPrefix,
+    trackLabel,
+    mode,
+  ) => {
+    const isScreen = trackLabel === "screen";
+    if (isScreen && mode === "all") {
+      await dropRetainedPrefix(store, keyPrefix, uploader, rangesRef);
+    }
     const ranges = rangesRef.current;
+    const { untrack, purge } = selectChunksToPurge({
+      ranges,
+      lastServerOffset: Number(uploader.lastServerOffset) || 0,
+      safetyWindowBytes: CHUNK_PURGE_SAFETY_WINDOW_BYTES,
+      prefixChunks: isScreen ? screenRetainedPrefixRef.current.chunks : 0,
+    });
+    if (!untrack.length) return;
     let purgedCount = 0;
     let purgedBytes = 0;
-    while (ranges.length > 0 && ranges[0].endByte <= cutoff) {
-      const entry = ranges[0];
-      if (entry.index === 0) {
-        ranges.shift();
-        continue;
-      }
+    for (const entry of purge) {
       try {
+        // eslint-disable-next-line no-await-in-loop
         await store.removeItem(`${keyPrefix}${entry.index}`);
       } catch (err) {
         console.warn(
@@ -1659,10 +1818,18 @@ const CloudRecorder = () => {
         );
         break;
       }
-      ranges.shift();
       purgedCount++;
       purgedBytes += entry.size || 0;
     }
+    // Stop at the first chunk whose delete failed so it's retried next pass.
+    // Retained chunks leave the tracking list even though their files stay.
+    const consumed =
+      purgedCount === purge.length
+        ? untrack.length
+        : untrack.indexOf(purge[purgedCount]);
+    // splice, not reassignment: this runs un-awaited while ondataavailable
+    // pushes new ranges onto the tail.
+    ranges.splice(0, Math.max(0, consumed));
     if (purgedCount > 0) {
       chunksPurgedDuringRecordingRef.current = true;
       chunksPurgedBytesRef.current += purgedBytes;
@@ -1703,6 +1870,22 @@ const CloudRecorder = () => {
     }
   };
 
+  // BG turns this into a /log/upload-event. chrome.storage.local alone told
+  // us nothing about whether local playback actually worked.
+  const reportLocalPlaybackOutcome = (outcome, detail = {}) => {
+    try {
+      chrome.runtime
+        .sendMessage({
+          type: "cloud-local-playback-report",
+          outcome,
+          recordingSessionId:
+            recorderSession.current?.id || recordingSessionId.current || null,
+          ...detail,
+        })
+        .catch(() => {});
+    } catch {}
+  };
+
   const registerLocalScreenPlaybackOffer = async ({
     projectId,
     sceneId,
@@ -1712,26 +1895,13 @@ const CloudRecorder = () => {
       return null;
     }
 
-    if (chunksPurgedDuringRecordingRef.current) {
-      console.info(
-        "[CloudRecorder] Local-first screen offer skipped: chunks were purged mid-recording",
-        {
-          projectId,
-          sceneId,
-          purgedScreenChunks: screenChunksPurgedCountRef.current,
-          purgedBytes: chunksPurgedBytesRef.current,
-        },
-      );
-      return null;
-    }
-
-    let chunkCount = 0;
+    let storeChunkCount = 0;
     try {
-      chunkCount = await chunksStore.length();
+      storeChunkCount = await chunksStore.length();
     } catch {
-      chunkCount = 0;
+      storeChunkCount = 0;
     }
-    if (!chunkCount) {
+    if (!storeChunkCount) {
       console.info(
         "[CloudRecorder] Local-first screen offer unavailable: no local chunks",
         {
@@ -1739,38 +1909,68 @@ const CloudRecorder = () => {
           sceneId,
         },
       );
+      reportLocalPlaybackOutcome("skipped", {
+        projectId,
+        sceneId,
+        reason: "no-local-chunks",
+      });
       return null;
     }
 
-    const estimatedBytes =
+    const totalBytes =
       screenUploader.current?.offset ||
       sessionTrackState.current?.screen?.bytesRecorded ||
       0;
-    if (!estimatedBytes || estimatedBytes <= 0) {
+    if (!totalBytes || totalBytes <= 0) {
       console.info(
         "[CloudRecorder] Local-first screen offer unavailable: no byte estimate",
         {
           projectId,
           sceneId,
-          chunkCount,
+          chunkCount: storeChunkCount,
         },
       );
+      reportLocalPlaybackOutcome("skipped", {
+        projectId,
+        sceneId,
+        reason: "no-byte-estimate",
+        chunkCount: storeChunkCount,
+      });
       return null;
     }
 
-    if (estimatedBytes > LOCAL_SCREEN_PLAYBACK_MAX_BYTES) {
-      console.info(
-        "[CloudRecorder] Local-first screen offer skipped: source too large",
-        {
-          projectId,
-          sceneId,
-          chunkCount,
-          estimatedBytes,
-          maxBytes: LOCAL_SCREEN_PLAYBACK_MAX_BYTES,
-        },
-      );
+    const plan = resolveLocalPlaybackPlan({
+      // The camera purge sets the shared flag too, which marked a fully
+      // retained screen source partial and sent the editor to a 404.
+      purged: screenChunksPurgedCountRef.current > 0,
+      prefix: screenRetainedPrefixRef.current,
+      totalBytes,
+      storeChunkCount,
+      maxBytes: LOCAL_SCREEN_PLAYBACK_MAX_BYTES,
+    });
+    if (!plan.chunkCount || !plan.availableBytes) {
+      console.info("[CloudRecorder] Local-first screen offer skipped", {
+        projectId,
+        sceneId,
+        reason: plan.reason,
+        totalBytes,
+        storeChunkCount,
+        purgedScreenChunks: screenChunksPurgedCountRef.current,
+        purgedBytes: chunksPurgedBytesRef.current,
+      });
+      reportLocalPlaybackOutcome("skipped", {
+        projectId,
+        sceneId,
+        reason: plan.reason,
+        totalBytes,
+        chunkCount: storeChunkCount,
+        purgeMode: purgeModeRef.current,
+      });
       return null;
     }
+
+    const chunkCount = plan.chunkCount;
+    const estimatedBytes = plan.availableBytes;
 
     const now = Date.now();
     const screenBackend = storageBackends.screen || "idb";
@@ -1791,6 +1991,11 @@ const CloudRecorder = () => {
       trackType: "screen",
       chunkCount,
       estimatedBytes,
+      // partial = the offer covers only the opening of the recording, so the
+      // editor falls back to the remote URL at the end.
+      partial: plan.partial,
+      availableBytes: estimatedBytes,
+      totalBytes,
       mediaId: uploadMeta?.screen?.mediaId || null,
       bunnyVideoId: uploadMeta?.screen?.videoId || null,
       createdAt: now,
@@ -1823,11 +2028,23 @@ const CloudRecorder = () => {
             offerId: result.offer.offerId,
             chunkCount: result.offer.chunkCount,
             estimatedBytes: result.offer.estimatedBytes,
+            partial: result.offer.partial,
+            totalBytes,
             expiresAt: result.offer.expiresAt,
           },
         );
         return result.offer;
       }
+      reportLocalPlaybackOutcome("skipped", {
+        projectId,
+        sceneId,
+        reason: result?.error || "register-rejected",
+        chunkCount,
+        availableBytes: estimatedBytes,
+        totalBytes,
+        partial: plan.partial,
+        purgeMode: purgeModeRef.current,
+      });
     } catch (err) {
       console.warn(
         "[CloudRecorder] Failed to register local-first screen offer",
@@ -1837,6 +2054,15 @@ const CloudRecorder = () => {
           error: err?.message || err,
         },
       );
+      reportLocalPlaybackOutcome("skipped", {
+        projectId,
+        sceneId,
+        reason: "register-failed",
+        chunkCount,
+        availableBytes: estimatedBytes,
+        totalBytes,
+        partial: plan.partial,
+      });
     }
 
     return null;
@@ -2036,7 +2262,16 @@ const CloudRecorder = () => {
       const micChosen = audioIntent.current?.micActive === true;
       const hasUploader = Boolean(audioUploader.current);
       const hasRecorder = Boolean(audioRecorder.current);
-      if (!micChosen && !hasUploader && !hasRecorder) return null;
+      // System-audio-only sessions have no mic/uploader/recorder but still carry
+      // audio via the screen (or camera, camera-only mode) WebCodecs recorder;
+      // null there means the MediaRecorder fallback.
+      const muxAudioDiag =
+        screenRecorder.current?.getAudioDiag?.() ||
+        cameraRecorder.current?.getAudioDiag?.() ||
+        null;
+      if (!micChosen && !hasUploader && !hasRecorder && !muxAudioDiag) {
+        return null;
+      }
 
       const track = rawMicStream.current?.getAudioTracks?.()[0] || null;
       const audioState = sessionTrackState.current?.audio || {};
@@ -2074,6 +2309,15 @@ const CloudRecorder = () => {
         audioInterruptedCount: audioHealthRef.current?.interruptedCount ?? 0,
         audioInterruptedMs: audioHealthRef.current?.interruptedTotalMs ?? 0,
         audioSawInterrupted: audioHealthRef.current?.sawInterrupted ?? false,
+        // Loss-stage discriminator: ctxTime lagging wall = mix-bus underrun.
+        // ctxTime tracking wall while receivedMs lags = reader loss after the bus.
+        audioCtxTimeMs: aCtx.current
+          ? Math.round((aCtx.current.currentTime || 0) * 1000)
+          : null,
+        audioCtxWallMs: aCtxCreatedAtRef.current
+          ? Date.now() - aCtxCreatedAtRef.current
+          : null,
+        ...(muxAudioDiag || {}),
       };
     } catch {
       return null;
@@ -2120,12 +2364,20 @@ const CloudRecorder = () => {
             lifecycleBundle = await getCompressedLifecycleLog();
           } catch {}
         }
+        // The server accepts encodeStats on any event type, so attach it here too.
+        const screenStats = screenRecorder.current?.getEncodeStats?.() || null;
+        const cameraStats = cameraRecorder.current?.getEncodeStats?.() || null;
         void emitUploadTelemetry(eventType, {
           status,
           screenDiag,
           cameraDiag,
           audioDiag,
           lifecycleBundle,
+          encodeStats: screenStats
+            ? { ...screenStats, track: "screen" }
+            : cameraStats
+              ? { ...cameraStats, track: "camera" }
+              : null,
         });
       }
     } catch {}
@@ -4058,6 +4310,10 @@ const CloudRecorder = () => {
     screenChunksPurgedCountRef.current = 0;
     cameraChunksPurgedCountRef.current = 0;
     chunksPurgedBytesRef.current = 0;
+    localWriteStatsRef.current = { count: 0, totalMs: 0, maxMs: 0, slowCount: 0 };
+    screenRetainedPrefixRef.current = emptyRetainedPrefix();
+    purgeModeRef.current = "none";
+    purgeInFlightRef.current = { screen: false, camera: false };
     firstChunkLoggedRef.current = false;
     resetUnloadGuard();
     recoveryExportedRef.current = false;
@@ -4127,6 +4383,7 @@ const CloudRecorder = () => {
           mimeType: screenOptions.mimeType,
           videoBitsPerSecond: screenOptions.videoBitsPerSecond,
           audioBitsPerSecond: screenOptions.audioBitsPerSecond,
+          audioChannels: audioBusChannels.current,
           enableAudio: screenHasAudio,
           createMediaRecorder,
           onDataAvailable: async (blob) => {
@@ -4186,6 +4443,7 @@ const CloudRecorder = () => {
               .set({ lastChunkAt: Date.now() })
               .catch(() => {});
 
+            const writeStartedAt = performance.now();
             await chunksStore
               .setItem(`chunk_${index.current}`, {
                 index: index.current,
@@ -4200,6 +4458,12 @@ const CloudRecorder = () => {
                 sendStopRecording();
                 throw err;
               });
+            const writeMs = performance.now() - writeStartedAt;
+            const writeStats = localWriteStatsRef.current;
+            writeStats.count += 1;
+            writeStats.totalMs += writeMs;
+            if (writeMs > writeStats.maxMs) writeStats.maxMs = writeMs;
+            if (writeMs >= 1000) writeStats.slowCount += 1;
 
             patchTrackState("screen", {
               durableChunkCount: index.current + 1,
@@ -4226,6 +4490,14 @@ const CloudRecorder = () => {
                   endByte,
                   size: blob?.size || 0,
                 });
+                screenRetainedPrefixRef.current = extendRetainedPrefix(
+                  screenRetainedPrefixRef.current,
+                  {
+                    index: index.current,
+                    endByte,
+                    budgetBytes: currentPrefixBudget(),
+                  },
+                );
                 void purgeConfirmedChunks(
                   chunksStore,
                   screenChunkByteRangesRef,
@@ -4448,6 +4720,7 @@ const CloudRecorder = () => {
           mimeType: cameraOptions.mimeType,
           videoBitsPerSecond: cameraOptions.videoBitsPerSecond,
           audioBitsPerSecond: cameraOptions.audioBitsPerSecond,
+          audioChannels: audioBusChannels.current,
           enableAudio: cameraHasAudio,
           createMediaRecorder,
           probeOptions: {
@@ -5087,10 +5360,55 @@ const CloudRecorder = () => {
         const camera = cameraRecorder.current?.getDiagSnapshot?.();
         const audio = getAudioDiagSnapshot();
         if (!screen && !camera && !audio) return;
+        // offsetBytes used to stay 0 all session then jump at finalize, leaving
+        // mid-recording upload behaviour unreconstructable.
+        const uploadedBytes =
+          (Number(screenUploader.current?.offset) || 0) +
+          (Number(cameraUploader.current?.offset) || 0) +
+          (Number(audioUploader.current?.offset) || 0);
+        const trackState = sessionTrackState.current || {};
+        const recordedBytes =
+          (trackState.screen?.bytesRecorded || 0) +
+          (trackState.camera?.bytesRecorded || 0) +
+          (trackState.audio?.bytesRecorded || 0);
+        const pressure = storagePressureRef.current || {};
+        const screenStats = screenRecorder.current?.getEncodeStats?.() || null;
+        const cameraStats = cameraRecorder.current?.getEncodeStats?.() || null;
+        const writeStats = localWriteStatsRef.current || {};
         void emitUploadTelemetry("recording_heartbeat", {
           screenDiag: screen || null,
           cameraDiag: camera || null,
           audioDiag: audio || null,
+          offset: uploadedBytes,
+          totalBytes: recordedBytes,
+          // Polled, not live: at most STORAGE_CHECK_INTERVAL_MS stale.
+          availableBytes:
+            typeof pressure.headroom === "number" ? pressure.headroom : null,
+          localBytes: Math.max(
+            0,
+            recordedBytes - (chunksPurgedBytesRef.current || 0),
+          ),
+          // Quota shrinking across samples means the OS disk itself is filling.
+          storageQuotaBytes:
+            typeof pressure.quota === "number" ? pressure.quota : null,
+          storageUsageBytes:
+            typeof pressure.usage === "number" ? pressure.usage : null,
+          encodeStats: screenStats
+            ? { ...screenStats, track: "screen" }
+            : cameraStats
+              ? { ...cameraStats, track: "camera" }
+              : null,
+          localWriteStats: writeStats.count
+            ? {
+                count: writeStats.count,
+                avgMs: Math.round(writeStats.totalMs / writeStats.count),
+                maxMs: Math.round(writeStats.maxMs),
+                slowCount: writeStats.slowCount,
+                // Server enum: opfs|idb|memory|unknown. Never null, or the
+                // sanitizer can drop the whole localWriteStats object.
+                backend: storageBackends.screen || "unknown",
+              }
+            : null,
         });
       } catch {}
     }, 30_000);
@@ -5247,6 +5565,31 @@ const CloudRecorder = () => {
         sceneId,
       });
 
+      // uploadMeta's dims are a pre-encode guess, wrong on 27% of scenes (see
+      // encodedDims.js). Scene size, aspect ratio, baseResolution and auto-zoom
+      // all key off what we send here, so ask the encoder what it actually wrote.
+      const reportedScreenDims = {
+        width: uploadMeta.screen?.width || 1920,
+        height: uploadMeta.screen?.height || 1080,
+      };
+      let screenTrackSettings = null;
+      try {
+        screenTrackSettings =
+          screenStream.current?.getVideoTracks?.()[0]?.getSettings?.() || null;
+      } catch {}
+      const screenEncoded = pickEncodedDims({
+        diag: screenRecorder.current?.getDiagSnapshot?.() || null,
+        trackSettings: screenTrackSettings,
+        fallback: reportedScreenDims,
+      });
+      // Clicks have to move with the corrected dims, or auto-zoom pans to the
+      // wrong place.
+      const scaledClickEvents = scaleClickEvents(
+        clickEvents,
+        reportedScreenDims,
+        screenEncoded,
+      );
+
       const payload = {
         sceneId,
         screenMediaId: uploadMeta.screen?.mediaId || null,
@@ -5262,10 +5605,7 @@ const CloudRecorder = () => {
           : null,
         thumbnail: uploadMeta.screen?.thumbnail || null,
         dimensions: {
-          screen: {
-            width: uploadMeta.screen?.width || 1920,
-            height: uploadMeta.screen?.height || 1080,
-          },
+          screen: { width: screenEncoded.width, height: screenEncoded.height },
           camera: uploadMeta.camera
             ? {
                 width: uploadMeta.camera?.width || 1920,
@@ -5274,7 +5614,7 @@ const CloudRecorder = () => {
               }
             : null,
         },
-        clickEvents,
+        clickEvents: scaledClickEvents,
         surface,
         instantMode: instantMode.current,
         newProject: !recordingToScene && (!multiMode || multiSceneCount === 0),
@@ -5859,6 +6199,7 @@ const CloudRecorder = () => {
         cameraChunksPurged: cameraChunksPurgedCountRef.current,
         bytesFreed: chunksPurgedBytesRef.current,
         safetyWindowBytes: CHUNK_PURGE_SAFETY_WINDOW_BYTES,
+        reason: purgeModeRef.current,
       });
     }
 
@@ -6809,11 +7150,26 @@ const CloudRecorder = () => {
         // Some platforms reject hint sampleRates; fall back to default.
         aCtx.current = new AudioContext();
       }
+      aCtxCreatedAtRef.current = Date.now();
       audioHealthRef.current = attachAudioContextWatchdog(
         aCtx.current,
         "CloudRecorder",
       );
       destination.current = aCtx.current.createMediaStreamDestination();
+      // A stereo destination duplicates a mono mic, wasting half the AAC bitrate.
+      // System audio only joins at start, so the lazy setMic path stays stereo.
+      audioBusChannels.current = null;
+      try {
+        const micTrack = micStream.current?.getAudioTracks?.()[0] || null;
+        const hasSystemAudio = Boolean(
+          screenStream.current?.getAudioTracks?.().length,
+        );
+        const micChannels = micTrack?.getSettings?.()?.channelCount || null;
+        if (micTrack && !hasSystemAudio && micChannels === 1) {
+          destination.current.channelCount = 1;
+          audioBusChannels.current = 1;
+        }
+      } catch {}
 
       if (micStream.current?.getAudioTracks().length) {
         audioInputGain.current = aCtx.current.createGain();

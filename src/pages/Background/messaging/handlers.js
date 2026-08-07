@@ -34,8 +34,6 @@ import {
   sendMessageTab,
   parseEditorTargetUrl,
   resolveEditorTabForTarget,
-  getValidatedEditorTab,
-  setEditorTabReference,
 } from "../tabManagement";
 import {
   handleRestart,
@@ -58,6 +56,7 @@ import {
   CLOUD_LOCAL_PLAYBACK_EVENT_KEY,
   CLOUD_LOCAL_PLAYBACK_ALARM,
 } from "../recording/cloudLocalPlaybackConstants";
+import { emitRecordingTelemetry } from "../recording/emitRecordingTelemetry";
 import { FIRST_CHUNK_WATCHDOG_ALARM, RECORDER_KEEPALIVE_ALARM } from "../alarms/alarmConstants";
 import { desktopCapture } from "../recording/desktopCapture";
 import {
@@ -208,8 +207,15 @@ const shouldShowReviewPrompt = async () => {
 };
 
 const STOP_RECORDING_TAB_DEBOUNCE_MS = 1200;
-const CLOUD_LOCAL_PLAYBACK_MAX_BYTES = 250 * 1024 * 1024;
-const CLOUD_LOCAL_PLAYBACK_MAX_CHUNKS = 4000;
+// Shared by concurrent unforced check-auth-status calls; see that handler.
+let inFlightUnforcedAuth = null;
+// Sanity backstop, not a transport limit: the bridge iframe hands the editor a Blob by
+// reference. Kept in step with LOCAL_SCREEN_PLAYBACK_MAX_BYTES in CloudRecorder.
+const CLOUD_LOCAL_PLAYBACK_MAX_BYTES = 8 * 1024 * 1024 * 1024;
+const CLOUD_LOCAL_PLAYBACK_MAX_CHUNKS = 20000;
+// Once the editor holds its own Blob our copy is dead weight, and it can now be the whole
+// recording rather than 250MB. Short TTL, but enough for an editor reload to re-request.
+const CLOUD_LOCAL_PLAYBACK_POST_USE_TTL_MS = 2 * 60 * 1000;
 const CLOUD_LOCAL_PLAYBACK_MIN_TTL_MS = 60 * 1000;
 const CLOUD_LOCAL_PLAYBACK_MAX_TTL_MS = 24 * 60 * 60 * 1000;
 let stopRecordingTabInFlight = false;
@@ -243,6 +249,13 @@ const normalizeLocalPlaybackOffer = (offer = {}) => {
   );
   const estimatedBytes = Math.max(0, Number(offer.estimatedBytes) || 0);
   const createdAt = Number(offer.createdAt) || now;
+  // Partial = only the leading chunks that survived mid-recording purging.
+  // totalBytes = finished upload size, so the editor knows what's missing.
+  const partial = Boolean(offer.partial);
+  const totalBytes = Math.max(
+    estimatedBytes,
+    Number(offer.totalBytes) || 0,
+  );
 
   // storageBackend / opfsSessionId let the read-chunk + clear handlers route
   // to the same backend the writer used. Older offers without these fields
@@ -270,6 +283,9 @@ const normalizeLocalPlaybackOffer = (offer = {}) => {
     status: offer.status || "available",
     chunkCount,
     estimatedBytes,
+    partial,
+    availableBytes: estimatedBytes,
+    totalBytes,
     mediaId: offer.mediaId || null,
     bunnyVideoId: offer.bunnyVideoId || null,
     storageBackend,
@@ -294,6 +310,41 @@ const offerScreenStore = (offer) => {
   // sharing the regular Recorder's IDB DB / "chunks" store name. The
   // imported chunksStore matches that exactly.
   return chunksStore;
+};
+
+// `status` and `reason` ride fields the server sanitizer already keeps, so this is
+// legible in prod before richer fields get allowlisted.
+const reportLocalPlaybackOutcome = (outcome, detail = {}) => {
+  const offer = detail.offer || null;
+  const now = Date.now();
+  const createdAt = Number(offer?.createdAt) || 0;
+  void emitRecordingTelemetry("local_playback_outcome", {
+    status: outcome,
+    reason: detail.reason || null,
+    recordingSessionId:
+      detail.recordingSessionId || offer?.recordingSessionId || null,
+    projectId: detail.projectId || offer?.projectId || null,
+    sceneId: detail.sceneId || offer?.sceneId || null,
+    mediaId: detail.mediaId || offer?.mediaId || null,
+    trackType: "screen",
+    offerId: detail.offerId || offer?.offerId || null,
+    partial:
+      typeof detail.partial === "boolean"
+        ? detail.partial
+        : Boolean(offer?.partial),
+    chunkCount: detail.chunkCount ?? offer?.chunkCount ?? null,
+    availableBytes:
+      detail.availableBytes ?? offer?.availableBytes ?? offer?.estimatedBytes ?? null,
+    totalBytes: detail.totalBytes ?? offer?.totalBytes ?? null,
+    localBytes: detail.localBytes ?? null,
+    // Time from offer creation to pickup (or give-up).
+    elapsedMs: createdAt ? now - createdAt : null,
+    storageBackend: detail.storageBackend || offer?.storageBackend || null,
+    container: detail.container || offer?.container || null,
+    encoderKind: detail.encoderKind || offer?.encoderKind || null,
+    purgeMode: detail.purgeMode || null,
+    transport: detail.transport || null,
+  });
 };
 
 const isLocalPlaybackOfferExpired = (offer) =>
@@ -988,35 +1039,20 @@ export const setupHandlers = () => {
       clearInterval(keepAlive);
     }
 
-    // Editor-tab proxy fallback (the original path).
-    let validated = await getValidatedEditorTab({
+    // The guarded resolver makes a concurrent open reuse the same in-flight tab
+    // instead of racing a second create.
+    const targetUrl = `${process.env.SCREENITY_APP_BASE}/editor/${projectId}/edit?load=true`;
+    const resolved = await resolveEditorTabForTarget({
+      targetUrl,
       expectedProjectId: projectId,
       expectedKind: "editor",
       reason: "forward-create-scene",
+      focus: false,
     });
-    if (!validated.ok || !validated.tab?.id) {
-      const targetUrl = `${process.env.SCREENITY_APP_BASE}/editor/${projectId}/edit?load=true`;
-      try {
-        const tab = await chrome.tabs.create({ url: targetUrl, active: false });
-        if (tab?.id) {
-          await setEditorTabReference({
-            tabId: tab.id,
-            tabUrl: targetUrl,
-            source: "forward-create-scene:auto-open",
-            expectedProjectId: projectId,
-          });
-          validated = { ok: true, tab: { id: tab.id }, reason: null };
-        }
-      } catch (err) {
-        return {
-          ok: false,
-          error: `failed-to-open-editor-tab:${err?.message || err}`,
-        };
-      }
-      if (!validated.tab?.id) {
-        return { ok: false, error: "no-editor-tab" };
-      }
+    if (!resolved?.tabId) {
+      return { ok: false, error: "no-editor-tab" };
     }
+    const validated = { ok: true, tab: { id: resolved.tabId } };
     const requestId =
       (typeof crypto !== "undefined" && crypto.randomUUID?.()) ||
       `scene-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
@@ -1199,19 +1235,24 @@ export const setupHandlers = () => {
     }
     try {
       // deterministic timeout so a wedged offscreen can't hang the caller
-      // forever. WebM is a full re-encode (minutes on large files), so it gets
-      // a far longer ceiling than the packet-copy remux; the editor's
+      // forever. WebM and mp4x are full re-encodes (minutes on large files), so
+      // they get a far longer ceiling than the packet-copy remux; the editor's
       // progress-reset stall guard catches a genuinely wedged conversion first.
-      const isWebm = message.kind === "webm";
-      const TIMEOUT_MS = isWebm ? 30 * 60_000 : 60_000;
+      const START_TYPE_BY_KIND = {
+        webm: "webm-start",
+        mp4x: "mp4x-start",
+      };
+      const isReencode = message.kind === "webm" || message.kind === "mp4x";
+      const TIMEOUT_MS = isReencode ? 30 * 60_000 : 60_000;
       let timeoutId = null;
       try {
         const response = await Promise.race([
           chrome.runtime.sendMessage({
-            type: isWebm ? "webm-start" : "remux-start",
+            type: START_TYPE_BY_KIND[message.kind] || "remux-start",
             requestId: message.requestId,
             inputFileName: message.inputFileName,
             outputFileName: message.outputFileName,
+            videoBitrate: message.videoBitrate,
           }),
           new Promise((_, reject) => {
             timeoutId = setTimeout(
@@ -1798,7 +1839,19 @@ export const setupHandlers = () => {
       // The popup mount opts out so a fresh install doesn't silently revive
       // auth from a leftover website cookie (it would flash the paid welcome
       // screen at a returning user who should just see "Log in").
-      return await loginWithWebsite({ force: message?.force !== false });
+      const force = message?.force !== false;
+      if (force) return await loginWithWebsite({ force: true });
+      // Every content script sends this on mount, so an install/update backfill
+      // fires one per open tab at once; they all read `lastAuthCheck` before any
+      // writes it, so each would hit /auth/verify separately. Share one run.
+      // Scoped to this handler: AUTH_SUCCESS also calls loginWithWebsite
+      // unforced and must not join a run that started before the login cookie landed.
+      if (!inFlightUnforcedAuth) {
+        inFlightUnforcedAuth = loginWithWebsite({ force: false }).finally(() => {
+          inFlightUnforcedAuth = null;
+        });
+      }
+      return await inFlightUnforcedAuth;
     },
   );
   registerMessage(
@@ -1840,9 +1893,15 @@ export const setupHandlers = () => {
     if (currentTab?.id) {
       await chrome.storage.local.set({ originalTabId: currentTab.id });
     }
-    chrome.tabs.create({
+    const loginTab = await chrome.tabs.create({
       url: `${process.env.SCREENITY_APP_BASE}/login?extension=true`,
       active: true,
+    });
+    // Marks an explicitly-started login so the tab-update fallback can finish it
+    // if AUTH_SUCCESS never arrives. Fresh installs have no other prior signal.
+    await chrome.storage.local.set({
+      loginPendingAt: Date.now(),
+      loginTabId: loginTab?.id ?? null,
     });
   });
   registerMessage("handle-logout", async (message, sender, sendResponse) => {
@@ -1863,6 +1922,8 @@ export const setupHandlers = () => {
       "isSubscribed",
       "isLoggedIn",
       "proSubscription",
+      "loginPendingAt",
+      "loginTabId",
     ];
     if (!recordingBusy) {
       removeKeys.push("screenityToken");
@@ -1986,8 +2047,21 @@ export const setupHandlers = () => {
 
   // serialize to avoid read-modify-write race losing clicks; cap array for long recordings
   const CLICK_EVENTS_MAX = 5000;
+  // Per-click writes cost the recorded page ~5ms of deserialize each (storage.local
+  // broadcasts the whole array to every content script in every tab). Batch instead.
+  const CLICK_FLUSH_MS = 2000;
   let _clickWriteQueue = Promise.resolve();
-  function storeClick(click) {
+  let _pendingClicks = [];
+  let _clickFlushTimer = null;
+
+  function flushClicks() {
+    if (_clickFlushTimer) {
+      clearTimeout(_clickFlushTimer);
+      _clickFlushTimer = null;
+    }
+    if (_pendingClicks.length === 0) return _clickWriteQueue;
+    const batch = _pendingClicks;
+    _pendingClicks = [];
     _clickWriteQueue = _clickWriteQueue
       .catch(() => {})
       .then(async () => {
@@ -1998,7 +2072,7 @@ export const setupHandlers = () => {
               const { clickEvents = [] } = await chrome.storage.local.get({
                 clickEvents: [],
               });
-              const next = clickEvents.concat(click);
+              const next = clickEvents.concat(batch);
               if (next.length > CLICK_EVENTS_MAX) {
                 next.splice(0, next.length - CLICK_EVENTS_MAX);
               }
@@ -2011,7 +2085,25 @@ export const setupHandlers = () => {
         } catch {
         }
       });
+    return _clickWriteQueue;
   }
+
+  function storeClick(click) {
+    _pendingClicks.push(click);
+    // Trailing edge only: a leading write puts the expensive broadcast back on the
+    // first click of every burst, which is the case that hurts.
+    if (!_clickFlushTimer) {
+      _clickFlushTimer = setTimeout(flushClicks, CLICK_FLUSH_MS);
+    }
+  }
+
+  // Flush on stop so clickEvents is complete when the recorder reads it at scene
+  // creation, and no click from this recording leaks into the next one's array.
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local" || !changes.recording) return;
+    if (changes.recording.newValue) return;
+    flushClicks();
+  });
 
   function getMonitorForWindow(message, sender, sendResponse) {
     chrome.system.display.getInfo((displays) => {
@@ -2326,6 +2418,9 @@ export const setupHandlers = () => {
               trackType: "screen",
               chunkCount: localPlaybackOffer.chunkCount,
               estimatedBytes: localPlaybackOffer.estimatedBytes,
+              partial: Boolean(localPlaybackOffer.partial),
+              availableBytes: localPlaybackOffer.availableBytes || null,
+              totalBytes: localPlaybackOffer.totalBytes || null,
               expiresAt: localPlaybackOffer.expiresAt,
               source: localPlaybackOffer.source || "indexeddb-screen-chunks",
               mediaId: localPlaybackOffer.mediaId || null,
@@ -2355,6 +2450,10 @@ export const setupHandlers = () => {
       return { ok: false, error: "missing-local-screen-bytes" };
     }
     if (normalizedOffer.estimatedBytes > CLOUD_LOCAL_PLAYBACK_MAX_BYTES) {
+      reportLocalPlaybackOutcome("skipped", {
+        offer: normalizedOffer,
+        reason: "offer-too-large",
+      });
       return {
         ok: false,
         error: "offer-too-large",
@@ -2383,10 +2482,28 @@ export const setupHandlers = () => {
       sceneId: normalizedOffer.sceneId,
       chunkCount: normalizedOffer.chunkCount,
       estimatedBytes: normalizedOffer.estimatedBytes,
+      partial: normalizedOffer.partial,
       expiresAt: normalizedOffer.expiresAt,
     });
+    reportLocalPlaybackOutcome("registered", { offer: normalizedOffer });
 
     return { ok: true, offer: normalizedOffer };
+  });
+  // Outcomes the recorder sees before an offer exists, so prod can distinguish
+  // "no offer was made" from "an offer went unused".
+  registerMessage("cloud-local-playback-report", async (message) => {
+    reportLocalPlaybackOutcome(message?.outcome || "skipped", {
+      reason: message?.reason || null,
+      recordingSessionId: message?.recordingSessionId || null,
+      projectId: message?.projectId || null,
+      sceneId: message?.sceneId || null,
+      partial: message?.partial,
+      chunkCount: message?.chunkCount ?? null,
+      availableBytes: message?.availableBytes ?? null,
+      totalBytes: message?.totalBytes ?? null,
+      purgeMode: message?.purgeMode || null,
+    });
+    return { ok: true };
   });
   registerMessage("cloud-local-playback-clear", async (message) => {
     const result = await clearStoredLocalPlaybackOffer({
@@ -2467,13 +2584,16 @@ export const setupHandlers = () => {
     if (!offer) {
       return { ok: false, error: "offer-unavailable" };
     }
+    const postUseExpiry = Date.now() + CLOUD_LOCAL_PLAYBACK_POST_USE_TTL_MS;
     const updated = {
       ...offer,
       status: "used",
       usedAt: Date.now(),
       usedBy: message?.usedBy || "editor",
       updatedAt: Date.now(),
+      expiresAt: Math.min(Number(offer.expiresAt) || postUseExpiry, postUseExpiry),
     };
+    await scheduleLocalPlaybackAlarm(updated);
     await chrome.storage.local.set({
       [CLOUD_LOCAL_PLAYBACK_KEY]: updated,
       [CLOUD_LOCAL_PLAYBACK_EVENT_KEY]: {
@@ -2489,7 +2609,33 @@ export const setupHandlers = () => {
       projectId: updated.projectId,
       sceneId: updated.sceneId,
     });
+    reportLocalPlaybackOutcome("used", {
+      offer: updated,
+      localBytes: Number(message?.localBytes) || null,
+      // "bridge" (Blob by reference) vs "runtime" (base64 copy): tells us whether
+      // the iframe path works in the field.
+      transport: message?.transport || null,
+      reason: message?.usedBy || "editor",
+    });
     return { ok: true, offer: updated };
+  });
+  // The bridge is addressable by any script on the app page, so it sends only
+  // an offerId and gets back the registered location, or nothing if unknown.
+  registerMessage("cloud-local-playback-redeem-offer", async (message) => {
+    const offer = await getValidLocalPlaybackOffer({
+      offerId: message?.offerId || null,
+    });
+    if (!offer) return { ok: false, error: "offer-unavailable" };
+    return {
+      ok: true,
+      offer: {
+        offerId: offer.offerId,
+        chunkCount: offer.chunkCount,
+        storageBackend: offer.storageBackend || null,
+        opfsSessionId: offer.opfsSessionId || null,
+        container: offer.container || null,
+      },
+    };
   });
   registerMessage("cloud-local-playback-mark-fallback", async (message) => {
     const offer = await getValidLocalPlaybackOffer({
@@ -2518,6 +2664,10 @@ export const setupHandlers = () => {
     });
     console.info("[Screenity][BG] Local screen playback offer fallback", {
       offerId: updated.offerId,
+      reason: updated.fallbackReason,
+    });
+    reportLocalPlaybackOutcome("fallback", {
+      offer: updated,
       reason: updated.fallbackReason,
     });
     return { ok: true, offer: updated };

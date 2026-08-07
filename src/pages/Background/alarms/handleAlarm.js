@@ -6,6 +6,8 @@ import { sweepRecorderTabs } from "../recording/sweepRecorderTabs.js";
 import { diagEvent } from "../../utils/diagnosticLog";
 import { lifecycle } from "../../utils/lifecycleLog";
 import { chunksStore } from "../recording/chunkHandler";
+import { openExistingChunksStore } from "../../CloudRecorder/recorderStorage/chooseChunksStore";
+import { destroySessionDir } from "../../CloudRecorder/recorderStorage/opfsKvStore";
 import { emitRecordingTelemetry } from "../recording/emitRecordingTelemetry";
 import { markFastRecorderFailure } from "../../../media/fastRecorderGate";
 import {
@@ -423,13 +425,54 @@ export const handleAlarm = async (alarm) => {
       return;
     }
 
-    await chunksStore.clear().catch((err) => {
+    // Clearing IDB unconditionally left OPFS sessions on disk. Survivable at 250MB
+    // offers, a whole-recording leak now, so route to the backend the writer used.
+    const expiredStore =
+      localPlaybackOffer.storageBackend === "opfs" &&
+      localPlaybackOffer.opfsSessionId
+        ? openExistingChunksStore({
+            sessionId: localPlaybackOffer.opfsSessionId,
+            track: "screen",
+            backend: "opfs",
+          }).store
+        : chunksStore;
+    await expiredStore.clear().catch((err) => {
       console.warn(
-        "[Screenity][BG] Failed to clear chunksStore for local playback expiry",
+        "[Screenity][BG] Failed to clear chunk store for local playback expiry",
         err,
       );
     });
+    if (
+      localPlaybackOffer.storageBackend === "opfs" &&
+      localPlaybackOffer.opfsSessionId
+    ) {
+      await destroySessionDir(localPlaybackOffer.opfsSessionId).catch(() => {});
+    }
     await chrome.storage.local.remove([CLOUD_LOCAL_PLAYBACK_KEY]);
+    // Still "available" at TTL means the editor never collected it, the one
+    // outcome nothing else reports.
+    if (localPlaybackOffer.status !== "used") {
+      void emitRecordingTelemetry("local_playback_outcome", {
+        status: "expired",
+        reason: localPlaybackOffer.status || "available",
+        recordingSessionId: localPlaybackOffer.recordingSessionId || null,
+        projectId: localPlaybackOffer.projectId || null,
+        sceneId: localPlaybackOffer.sceneId || null,
+        mediaId: localPlaybackOffer.mediaId || null,
+        trackType: "screen",
+        offerId: localPlaybackOffer.offerId,
+        partial: Boolean(localPlaybackOffer.partial),
+        chunkCount: localPlaybackOffer.chunkCount || null,
+        availableBytes: localPlaybackOffer.estimatedBytes || null,
+        totalBytes: localPlaybackOffer.totalBytes || null,
+        elapsedMs: Number(localPlaybackOffer.createdAt)
+          ? Date.now() - Number(localPlaybackOffer.createdAt)
+          : null,
+        storageBackend: localPlaybackOffer.storageBackend || null,
+        container: localPlaybackOffer.container || null,
+        encoderKind: localPlaybackOffer.encoderKind || null,
+      });
+    }
     await chrome.storage.local.set({
       [CLOUD_LOCAL_PLAYBACK_EVENT_KEY]: {
         event: "offer-expired",

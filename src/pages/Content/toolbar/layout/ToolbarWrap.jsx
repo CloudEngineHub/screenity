@@ -23,7 +23,7 @@ import Toast from "../components/Toast";
 
 import { CloseIconPopup } from "../components/SVG";
 
-import { contentStateContext } from "../../context/ContentState";
+import { contentStateContext, timerContext } from "../../context/ContentState";
 
 import {
   GrabIcon,
@@ -45,8 +45,8 @@ import {
 import MicToggle from "../components/MicToggle";
 
 const ToolbarWrap = () => {
-  const [contentState, setContentState, t, setT] =
-    useContext(contentStateContext);
+  const [contentState, setContentState] = useContext(contentStateContext);
+  const [t] = useContext(timerContext);
   const [mode, setMode] = React.useState("");
   const modeRef = React.useRef(mode);
   const [hovering, setHovering] = React.useState(false);

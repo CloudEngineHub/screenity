@@ -15,7 +15,13 @@ import {
   constrainTrackDown,
   enforceOversampleRatio,
 } from "../utils/captureResolution";
-import { getBitrates, getResolutionForQuality } from "./recorderConfig";
+import {
+  getBitrates,
+  getResolutionForQuality,
+  computeTargetVideoBps,
+  getFreeCaptureCaps,
+  orientBoxToSource,
+} from "./recorderConfig";
 import {
   WebCodecsRecorder,
   preloadWebCodecsModules,
@@ -30,6 +36,7 @@ import { getUserMediaWithFallback } from "../utils/mediaDeviceFallback";
 import { startAudioStream as acquireMicStream } from "../utils/startAudioStream";
 import { shouldAcquireMicAtStart } from "../utils/micAcquisitionPolicy";
 import { attachAudioContextWatchdog } from "../utils/audioContextWatchdog";
+import { beginFinalizeHeartbeat } from "../utils/finalizeHeartbeat";
 import { IS_OFFSCREEN_HOST } from "../utils/recordingHost";
 import { sendSystemAudioGuidanceToast } from "../utils/systemAudioGuidance";
 import {
@@ -139,8 +146,6 @@ function logRecordingSnapshot(label, data) {
   debug(`Recording snapshot: ${label}`, data);
 }
 
-const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
-
 const QUALITY_ORDER = ["240p", "360p", "480p", "720p", "1080p", "4k"];
 
 const clampQualityValue = (value, maxValue) => {
@@ -150,43 +155,6 @@ const clampQualityValue = (value, maxValue) => {
     ? current
     : max;
 };
-
-const getFreeCaptureCaps = async () => {
-  try {
-    const { isLoggedIn, isSubscribed } = await chrome.storage.local.get([
-      "isLoggedIn",
-      "isSubscribed",
-    ]);
-    const isPro = Boolean(isLoggedIn && isSubscribed);
-    return {
-      isPro,
-      maxQuality: "1080p",
-      maxFps: 60,
-    };
-  } catch {
-    return {
-      isPro: false,
-      maxQuality: "1080p",
-      maxFps: 60,
-    };
-  }
-};
-
-// bits/pixel/sec. 0.10 put 1080p30 at 6.2 Mbps, under the 0.15-0.25 screen
-// content wants, and text edges are the first thing H.264 discards.
-const VIDEO_BPP_FPS_PRO = 0.15;
-const VIDEO_BPP_FPS_FREE = 0.08;
-const VIDEO_BPS_MIN = 4_000_000;
-const VIDEO_BPS_MAX = 24_000_000;
-
-const computeTargetVideoBps = (width, height, fps, isPro = false) => {
-  const pixels = Number(width) * Number(height);
-  const rate = Number.isFinite(fps) && fps > 0 ? fps : 30;
-  const factor = isPro ? VIDEO_BPP_FPS_PRO : VIDEO_BPP_FPS_FREE;
-  const target = Math.round(pixels * rate * factor);
-  return clamp(target, VIDEO_BPS_MIN, VIDEO_BPS_MAX);
-};
-
 
 const Recorder = () => {
   const isRestarting = useRef(false);
@@ -318,6 +286,9 @@ const Recorder = () => {
 
   const aCtx = useRef(null);
   const destination = useRef(null);
+  // Only set when we force the bus to mono: getSettings() can report 2 while the
+  // node mixes mono. Null lets the encoder read the track.
+  const audioBusChannels = useRef(null);
   const audioInputSource = useRef(null);
   const audioOutputSource = useRef(null);
   const audioInputGain = useRef(null);
@@ -1399,8 +1370,9 @@ const Recorder = () => {
     const effectiveQualityValue = isPro
       ? qualityValue
       : clampQualityValue(qualityValue, maxQuality);
-    const { audioBitsPerSecond, videoBitsPerSecond: bitratePreset } =
-      getBitrates(effectiveQualityValue);
+    const { audio: audioBitsPerSecond, video: bitratePreset } = getBitrates(
+      effectiveQualityValue,
+    );
     let videoBitsPerSecond = bitratePreset;
 
     debug("Bitrates resolved", {
@@ -1602,10 +1574,17 @@ const Recorder = () => {
 
     const videoTrack = liveStream.current?.getVideoTracks()[0] ?? null;
     const settings = videoTrack?.getSettings() || {};
-    const { width: qualityWidth, height: qualityHeight } =
-      getResolutionForQuality(effectiveQualityValue);
-    const trackWidth = settings.width ?? qualityWidth ?? 1920;
-    const trackHeight = settings.height ?? qualityHeight ?? 1080;
+    const tier = getResolutionForQuality(effectiveQualityValue);
+    const trackWidth = settings.width ?? tier.width ?? 1920;
+    const trackHeight = settings.height ?? tier.height ?? 1080;
+    // The tier is written landscape and would bind on height against a portrait
+    // source; orient it to the source first so the tier caps the long edge, not the shape.
+    const { width: qualityWidth, height: qualityHeight } = orientBoxToSource(
+      trackWidth,
+      trackHeight,
+      tier.width,
+      tier.height,
+    );
     // Fit inside the tier with aspect preserved, matching the encoder. Clamping
     // each axis separately overstated the pixel count on non-16:9 sources
     // (3440x1440 encodes to 1920x804), and the bitrate below derives from these.
@@ -1973,6 +1952,7 @@ const Recorder = () => {
           fps,
           videoBitrate: videoBitsPerSecond,
           audioBitrate: hasAudioTrack ? audioBitsPerSecond : undefined,
+          audioChannels: audioBusChannels.current,
           enableAudio: hasAudioTrack,
           videoEncoderConfig: selectedVideoConfig,
           containerKind,
@@ -3153,6 +3133,14 @@ const Recorder = () => {
     // sequential awaits under contention, delaying editor-open.
     void updateFreeFinalizeStatus("stopping", 0);
 
+    // Keeps the editor's reader waiting through a long flush instead of
+    // reading a truncated file. Cleared in the finally below.
+    const stopFinalizeHeartbeat = beginFinalizeHeartbeat(
+      chunkBackendRef.current?.backend === "opfs"
+        ? chunkBackendRef.current?.fileName
+        : null,
+    );
+
     stopSessionHeartbeat();
     stopRecordingTick();
     persistSessionState("stopping");
@@ -3203,6 +3191,8 @@ const Recorder = () => {
       }
     } catch (err) {
       debugError("stopRecording() error while stopping recorder", err);
+    } finally {
+      stopFinalizeHeartbeat();
     }
 
     await waitForDrain();
@@ -3891,6 +3881,24 @@ const Recorder = () => {
     // gate mixing on `data.systemAudio`.
     const sysTracks = helperVideoStream.current.getAudioTracks();
     debug("System/tab audio tracks", sysTracks.length, "systemAudio:", data.systemAudio);
+
+    // Mic-only: a stereo destination just duplicates a mono mic, halving effective
+    // bitrate. Must be set before any source connects.
+    audioBusChannels.current = null;
+    try {
+      const micTrackForBus =
+        helperAudioStream.current?.getAudioTracks?.()[0] || null;
+      const willMixSystemAudio = sysTracks.length > 0 && data.systemAudio;
+      if (
+        micTrackForBus &&
+        !willMixSystemAudio &&
+        micTrackForBus.getSettings?.()?.channelCount === 1
+      ) {
+        destination.current.channelCount = 1;
+        audioBusChannels.current = 1;
+      }
+    } catch {}
+
     if (sysTracks.length > 0 && data.systemAudio) {
       const sysTrack = sysTracks[0];
       const sysSource = aCtx.current.createMediaStreamSource(

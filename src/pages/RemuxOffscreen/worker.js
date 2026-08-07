@@ -248,13 +248,14 @@ const remuxToOpfs = async ({ requestId, inputFileName, outputFileName }) => {
   }
 };
 
-// Re-encodes an MP4 (H.264) to WebM (VP9) from OPFS to OPFS, streaming output
-// so memory stays bounded on large files (the in-editor BufferTarget path OOMs
-// past ~2 GB). Far slower than the remux (it fully decodes and re-encodes
-// every frame), but it can't passthrough since WebM can't hold H.264.
-const convertWebmToOpfs = async ({ requestId, inputFileName, outputFileName }) => {
+// Neither direction can passthrough (WebM can't hold H.264, MP4 can't usefully hold VP8),
+// so it's a full re-encode. Streams OPFS to OPFS since BufferTarget OOMs past ~2GB.
+const convertViaEncoder = async (
+  { requestId, inputFileName, outputFileName, videoBitrate },
+  targetFormat = "webm",
+) => {
   const startedAt = Date.now();
-  devLog("webm-start", { requestId, inputFileName, outputFileName });
+  devLog(`${targetFormat}-start`, { requestId, inputFileName, outputFileName });
   await sweepOpfsStaleFiles();
 
   let dir;
@@ -288,10 +289,20 @@ const convertWebmToOpfs = async ({ requestId, inputFileName, outputFileName }) =
 
     const writable = createOpfsWritable(syncHandle);
 
-    await videoConverter.convertToWebM(inputFile, {
+    const convertOptions = {
       target: new StreamTarget(writable),
       onProgress: (p) => postProgress(requestId, p),
-    });
+    };
+    // Without this the converter falls back to its 5 Mbps default, which is a
+    // 1080p figure: a 4K screencast came back visibly blocky on text.
+    if (Number.isFinite(videoBitrate) && videoBitrate > 0) {
+      convertOptions.videoBitrate = videoBitrate;
+    }
+    if (targetFormat === "mp4") {
+      await videoConverter.convertToMP4(inputFile, convertOptions);
+    } else {
+      await videoConverter.convertToWebM(inputFile, convertOptions);
+    }
 
     try {
       await writable.close();
@@ -301,13 +312,13 @@ const convertWebmToOpfs = async ({ requestId, inputFileName, outputFileName }) =
     syncHandle.close();
     handleReleased = true;
 
-    devLog("webm-done", {
+    devLog(`${targetFormat}-done`, {
       durationMs: Date.now() - startedAt,
       outputBytes: finalSize,
     });
     postDone(requestId, outputFileName);
   } catch (err) {
-    devLog("webm-error", {
+    devLog(`${targetFormat}-error`, {
       err: String(err?.message || err).slice(0, 200),
       durationMs: Date.now() - startedAt,
     });
@@ -329,5 +340,6 @@ self.onmessage = (e) => {
   const msg = e.data;
   if (!msg) return;
   if (msg.type === "remux") remuxToOpfs(msg);
-  else if (msg.type === "webm") convertWebmToOpfs(msg);
+  else if (msg.type === "webm") convertViaEncoder(msg, "webm");
+  else if (msg.type === "mp4x") convertViaEncoder(msg, "mp4");
 };

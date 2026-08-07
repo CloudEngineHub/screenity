@@ -275,7 +275,10 @@ const ResizableBox = () => {
             outline: hideRegionUI ? "none" : "2px dashed #D9D9D9",
             // Push outline inside the box so it isn't visible in recordings.
             outlineOffset: "2px",
-            boxShadow: "0 0 0 9999px rgba(0, 0, 0, 0.2)",
+            // Dims outside the crop box while choosing it. Once recording starts
+            // it's off-camera anyway, and this spread is a viewport-sized
+            // translucent layer the page below has to keep compositing.
+            boxShadow: hideRegionUI ? "none" : "0 0 0 9999px rgba(0, 0, 0, 0.2)",
             borderRadius: "5px",
             zIndex: 2,
             boxSizing: "border-box",

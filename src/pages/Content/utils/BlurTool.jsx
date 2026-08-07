@@ -31,7 +31,15 @@ const BlurTool = () => {
     }
   }, [contentState.showExtension]);
 
+  // Only while picking: blurred elements keep their class/filter rule
+  // regardless, so persistence doesn't need these. Capture-phase on
+  // document.body, ahead of the host page's own handlers on every page we inject into.
   useLayoutEffect(() => {
+    if (!contentState.blurMode) return;
+    // useLayoutEffect runs before the effect that syncs blurModeRef, so seed it
+    // here or the first events after entering blur mode take the disabled path.
+    blurModeRef.current = true;
+
     const updateOutline = (target) => {
       if (!target) return;
       hoveredElementRef.current = target;
@@ -135,8 +143,14 @@ const BlurTool = () => {
       document.body.removeEventListener("mouseup", handleMouseUp, true);
       document.body.removeEventListener("click", handleElementClick, true);
       document.removeEventListener("scroll", handleScroll, true);
+      // handleMouseMove owns the pointer cursor and the hover outline, so
+      // leaving blur mode has to undo both here; nothing else is listening.
+      document.body.style.cursor = "auto";
+      hoveredElementRef.current = null;
+      setShowOutline(false);
+      setOutlineRect(null);
     };
-  }, []);
+  }, [contentState.blurMode]);
 
   return (
     <div>

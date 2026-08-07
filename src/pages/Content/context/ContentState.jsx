@@ -26,6 +26,9 @@ import {
 import { triggerSupportDownload } from "../../utils/triggerSupportDownload";
 
 export const contentStateContext = createContext();
+// Split out of contentStateContext: the 1s clock tick was re-rendering every
+// consumer in the page's shadow tree. Now it only hits the toolbar clock.
+export const timerContext = createContext([0, () => {}]);
 export const contentStateRef = { current: null };
 export let setContentState = () => {};
 export let setTimer = () => {};
@@ -48,6 +51,8 @@ const deriveCursorMode = (effects, fallbackMode) => {
 // tab/region recordings (they leak into other tabs today). Computation errs
 // toward showing; setting this false restores the prior always-show behavior.
 const ENABLE_TAB_SCOPED_UI = true;
+// How long a stop beep claimed by one tab silences the others.
+const STOP_BEEP_DEDUPE_MS = 5000;
 
 const ContentState = (props) => {
   const [timer, setTimerInternal] = React.useState(0);
@@ -65,6 +70,14 @@ const ContentState = (props) => {
   const prevRecordingRef = useRef(null);
   const hydratedRef = useRef(false);
   const suppressStopBeepRef = useRef(false);
+  // The ref only silences this tab. Stopping from a tab that isn't the
+  // recording-UI owner made both beep, so the claim has to be cross-tab.
+  const claimStopBeep = () => {
+    suppressStopBeepRef.current = true;
+    try {
+      chrome.storage.local.set({ stopBeepHandledAt: Date.now() });
+    } catch {}
+  };
   const suppressStartBeepRef = useRef(false);
   const tabIdRef = useRef(null);
   const activeTabRef = useRef(null);
@@ -285,7 +298,7 @@ const ContentState = (props) => {
 
   const restartRecording = useCallback(() => {
     // Suppress the stop beep: restart transitions recording true→false briefly.
-    suppressStopBeepRef.current = true;
+    claimStopBeep();
     const sourceTabId = tabIdRef.current ?? activeTabRef.current ?? null;
     chrome.storage.local.set({ restarting: true });
     setTimeout(() => {
@@ -383,7 +396,7 @@ const ContentState = (props) => {
     try {
       playBeep(stopBeepRef, "assets/sounds/beep.mp3");
     } catch {}
-    suppressStopBeepRef.current = true;
+    claimStopBeep();
     chrome.runtime.sendMessage(
       { type: "stop-recording-tab", reason: "content-toolbar-stop" },
       (res) => {
@@ -479,7 +492,7 @@ const ContentState = (props) => {
 
   const dismissRecording = useCallback((reason = "user-dismiss") => {
     setStartFlowOutcome("cancelled");
-    suppressStopBeepRef.current = true;
+    claimStopBeep();
     chrome.runtime.sendMessage({ type: "clear-recording-alarm" });
     chrome.storage.local.set({
       restarting: false,
@@ -1553,7 +1566,11 @@ const ContentState = (props) => {
       if (suppressStopBeepRef.current) {
         suppressStopBeepRef.current = false;
       } else {
-        playBeep(stopBeepRef, "assets/sounds/beep.mp3");
+        chrome.storage.local.get(["stopBeepHandledAt"], (r) => {
+          const at = Number(r?.stopBeepHandledAt) || 0;
+          if (Date.now() - at < STOP_BEEP_DEDUPE_MS) return;
+          playBeep(stopBeepRef, "assets/sounds/beep.mp3");
+        });
       }
     }
 
@@ -2161,47 +2178,6 @@ const ContentState = (props) => {
     }
   }, [contentState.backgroundEffect, contentState.backgroundEffectsActive]);
 
-  useEffect(() => {
-    if (!contentState.parentRef) return;
-
-    const isMac = navigator.platform.toUpperCase().indexOf("MAC") >= 0;
-    if (isMac) return;
-
-    const parentDiv = contentState.parentRef;
-
-    const elements = parentDiv.querySelectorAll("*");
-    elements.forEach((element) => {
-      element.classList.add("screenity-scrollbar");
-    });
-
-    const observer = new MutationObserver((mutationsList) => {
-      for (const mutation of mutationsList) {
-        if (mutation.type === "childList") {
-          const addedNodes = Array.from(mutation.addedNodes);
-          const removedNodes = Array.from(mutation.removedNodes);
-
-          addedNodes.forEach((node) => {
-            if (node.nodeType === Node.ELEMENT_NODE) {
-              node.classList.add("screenity-scrollbar");
-            }
-          });
-
-          removedNodes.forEach((node) => {
-            if (node.nodeType === Node.ELEMENT_NODE) {
-              node.classList.remove("screenity-scrollbar");
-            }
-          });
-        }
-      }
-    });
-
-    observer.observe(parentDiv, { childList: true, subtree: true });
-
-    return () => {
-      observer.disconnect();
-    };
-  }, [contentState.parentRef]);
-
   // Programmatically add custom scrollbars
   useEffect(() => {
     if (!contentState.shadowRef) return;
@@ -2243,12 +2219,10 @@ const ContentState = (props) => {
     return () => {
       observer.disconnect();
     };
-  }, [
-    contentState.parentRef,
-    contentState.shadowRef,
-    contentState.bigTab,
-    contentState.recordingType,
-  ]);
+    // The observer already classes nodes as they're added, so re-running this
+    // on bigTab/recordingType only re-walked the whole shadow tree with
+    // querySelectorAll("*") on every popup tab switch to no effect.
+  }, [contentState.shadowRef]);
 
   useEffect(() => {
     if (!contentState.hideUI) {
@@ -2311,18 +2285,23 @@ const ContentState = (props) => {
   }, []);
 
   // Memoize: a fresh array literal would re-render every consumer per parent update.
+  // Timer stays out of this on purpose, so the 1s tick doesn't invalidate it.
   const providerValue = useMemo(
-    () => [contentState, setContentState, timer, setTimer],
-    [contentState, timer],
+    () => [contentState, setContentState],
+    [contentState],
   );
+
+  const timerValue = useMemo(() => [timer, setTimer], [timer]);
 
   return (
     <contentStateContext.Provider value={providerValue}>
-      {props.children}
-      <Shortcuts shortcuts={contentState.shortcuts} />
-      {process.env.SCREENITY_DEV_MODE === "true" && (
-        <DevHUD contentStateRef={contentStateRef} setContentState={setContentState} />
-      )}
+      <timerContext.Provider value={timerValue}>
+        {props.children}
+        <Shortcuts shortcuts={contentState.shortcuts} />
+        {process.env.SCREENITY_DEV_MODE === "true" && (
+          <DevHUD contentStateRef={contentStateRef} setContentState={setContentState} />
+        )}
+      </timerContext.Provider>
     </contentStateContext.Provider>
   );
 };

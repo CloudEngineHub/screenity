@@ -1,4 +1,3 @@
-import { fabric } from "../fabricCompat";
 
 const getState = (stateOrRef) =>
   stateOrRef && stateOrRef.current ? stateOrRef.current : stateOrRef;

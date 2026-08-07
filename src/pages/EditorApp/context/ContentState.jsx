@@ -41,6 +41,9 @@ const loadMb = () => {
 // can stall on large recordings. Flag-gated; download falls back to the on-
 // demand remux and the fragmented file if disabled or if the finalize fails.
 const ENABLE_EAGER_MP4_FINALIZE = true;
+// Long enough to outlast the load-time blob swaps, short enough that the
+// pre-warm still beats the user reaching Download.
+const EAGER_MP4_SETTLE_MS = 1500;
 
 // Route the MP4 -> WebM re-encode through the offscreen worker (OPFS-streamed,
 // bounded memory) instead of the in-editor BufferTarget path that OOMs on large
@@ -1614,9 +1617,8 @@ const ContentState = (props) => {
           const errCode = message?.errorCode || "UNKNOWN";
           contentStateRef.current.openModal(
             chrome.i18n.getMessage("opfsLoadErrorTitle"),
-            // Never surface the raw internal `why` (e.g. "WebCodecs produced
-            // no encoded video within 12000ms") — it's engineer-facing. The
-            // raw string still rides along in the diag bundle via diagForward.
+            // Never show the raw internal `why` (e.g. "WebCodecs produced no
+            // encoded video within 12000ms"). It still reaches diagForward.
             chrome.i18n.getMessage("opfsLoadErrorDescription"),
             null,
             chrome.i18n.getMessage("permissionsModalDismiss"),
@@ -3029,7 +3031,17 @@ const ContentState = (props) => {
     return new Blob([target.buffer], { type: "video/mp4" });
   };
 
-  // OPFS sync access handle in an offscreen worker; bypasses BufferTarget's 2 GB cap
+  // ~0.08 bits per pixel per frame for screen content. 1080p30 lands on the
+  // converter's own 5 Mbps default, so only higher resolutions actually move.
+  const encodeBitrateForSource = () => {
+    const w = Number(contentStateRef.current?.width) || 0;
+    const h = Number(contentStateRef.current?.height) || 0;
+    if (!(w > 0) || !(h > 0)) return null;
+    const raw = Math.round(w * h * 30 * 0.08);
+    return Math.min(24_000_000, Math.max(2_000_000, raw));
+  };
+
+  // OPFS sync access handle in an offscreen worker, bypassing BufferTarget's 2GB cap.
   const remuxViaOffscreenOpfs = async (
     fragmentedBlob,
     onProgress,
@@ -3128,6 +3140,7 @@ const ContentState = (props) => {
         requestId,
         inputFileName,
         outputFileName,
+        videoBitrate: encodeBitrateForSource(),
       });
       if (!response || response.ok !== true) {
         devLog("offscreen-remux-response-bad", response);
@@ -3268,13 +3281,64 @@ const ContentState = (props) => {
     return { blob: remuxedBlob, path: remuxPath };
   };
 
+  // Ask mediabunny, not a hardcoded profile string. isConfigSupported with
+  // avc1.42E01E reports false on machines that encode H.264 High fine.
+  const canEncodeMp4Video = async () => {
+    try {
+      const mb = await loadMb();
+      if (typeof mb.canEncodeVideo === "function") {
+        return await mb.canEncodeVideo("avc");
+      }
+    } catch {}
+    return false;
+  };
+
+  // WebM sources need a full re-encode, not a remux. MP4 cannot carry VP8 or
+  // VP9 in any form players accept.
+  const transcodeToMp4 = async (blob) => {
+    const inputBytes = blob?.size || 0;
+    diagForward("editor-transcode-start", { inputBytes });
+    try {
+      const out = await runRemuxWithStallGuard(
+        (pg) => remuxViaOffscreenOpfs(blob, pg, "mp4x"),
+        sharedFinalizeProgress,
+      );
+      diagForward("editor-transcode-ok", {
+        inputBytes,
+        outputBytes: out?.size || 0,
+      });
+      return { blob: out, path: "webm-transcode" };
+    } catch (err) {
+      diagForward("editor-transcode-fail", {
+        inputBytes,
+        reason: String(err?.message || err).slice(0, 120),
+      });
+      return { blob: null, path: null };
+    }
+  };
+
   // Cache + dedupe the standard-MP4 finalize, keyed on the exact source blob so
-  // an edit (which produces a new blob) re-finalizes. Lets the result be pre-
-  // warmed in the background on editor-ready and reused instantly on download.
+  // an edit (which produces a new blob) re-finalizes.
   const ensureStandardMp4 = () => {
     const blob = contentStateRef.current?.blob;
-    if (!blob || blob.type !== "video/mp4") {
-      return Promise.resolve({ blob: null, path: null });
+    if (!blob) return Promise.resolve({ blob: null, path: null });
+    if (blob.type !== "video/mp4") {
+      const cur = standardMp4Ref.current;
+      if (cur && cur.forBlob === blob && cur.status !== "failed") {
+        return cur.promise;
+      }
+      const promise = transcodeToMp4(blob).then((res) => {
+        standardMp4Ref.current = {
+          status: res.blob ? "ready" : "failed",
+          promise,
+          forBlob: blob,
+          blob: res.blob,
+          path: res.path,
+        };
+        return res;
+      });
+      standardMp4Ref.current = { status: "pending", promise, forBlob: blob };
+      return promise;
     }
     const cur = standardMp4Ref.current;
     if (
@@ -3306,7 +3370,12 @@ const ContentState = (props) => {
     if (!contentState.ready) return;
     if (contentState.blob?.type !== "video/mp4") return;
     if (standardMp4Ref.current?.forBlob === contentState.blob) return;
-    ensureStandardMp4().catch(() => {});
+    // The cache keys on blob identity and loading swaps the blob 2-3 times, so
+    // every swap started a conversion: 3 remuxes of one recording in 455ms.
+    const settle = setTimeout(() => {
+      ensureStandardMp4().catch(() => {});
+    }, EAGER_MP4_SETTLE_MS);
+    return () => clearTimeout(settle);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [contentState.ready, contentState.blob]);
 
@@ -3317,10 +3386,37 @@ const ContentState = (props) => {
     // downloading is the real lock
     if (latest.downloading) return;
     downloadCancelledRef.current = false;
+    const sourceType = latest.blob?.type || null;
+    // ensureStandardMp4 only finalizes fragmented MP4. Until transcode lands, a
+    // non-MP4 source ships under its real extension, not a renamed .mp4.
+    const sourceIsMp4 = sourceType === "video/mp4";
     diagForward("editor-download-start", {
       kind: "mp4",
       bytes: latest.blob?.size ?? null,
+      sourceType,
     });
+
+    // A WebM source is transcoded below. Only refuse when the machine has no
+    // H.264 encoder at all, and then hand back the source under its real name.
+    if (!sourceIsMp4 && !(await canEncodeMp4Video())) {
+      diagForward("editor-download-nonmp4-source", {
+        sourceType,
+        reason: "no-avc-encoder",
+      });
+      const ext = String(sourceType || "").includes("webm") ? ".webm" : ".bin";
+      try {
+        const url = URL.createObjectURL(latest.blob);
+        await requestDownload(url, ext);
+        URL.revokeObjectURL(url);
+        setContentState((prev) => ({ ...prev, saved: true }));
+      } catch (err) {
+        diagForward("editor-download-fail", {
+          kind: "mp4",
+          reason: `nonmp4-source:${String(err?.message || err).slice(0, 60)}`,
+        });
+      }
+      return;
+    }
 
     setContentState((prev) => ({
       ...prev,
@@ -3383,10 +3479,17 @@ const ContentState = (props) => {
       }
     } catch (err) {
       console.error("MP4 download failed:", err);
-      // tier 3: serve fMP4 as-is so the user doesn't lose the recording
+      // tier 3: serve the source as-is so the user doesn't lose the recording.
+      // The guard above returns early only when there's no H.264 encoder, so a
+      // WebM source whose transcode failed still lands here and has to keep its
+      // real extension. WebM bytes named .mp4 won't open in QuickTime.
       try {
-        const url = URL.createObjectURL(contentState.blob);
-        await requestDownload(url, ".mp4");
+        const fallbackBlob = contentState.blob;
+        const fallbackExt = String(fallbackBlob?.type || "").includes("webm")
+          ? ".webm"
+          : ".mp4";
+        const url = URL.createObjectURL(fallbackBlob);
+        await requestDownload(url, fallbackExt);
         URL.revokeObjectURL(url);
         setContentState((prev) => ({ ...prev, saved: true }));
       } catch (fallbackErr) {

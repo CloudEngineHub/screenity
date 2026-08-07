@@ -346,15 +346,35 @@ export const handleGetStreamingData = async () => {
 
 export const videoReady = async () => {
   perfMark("BG.recordingHelpers videoReady.enter");
-  const { recordingDuration, recordingTab, lastRecordingBackendRef } =
-    await chrome.storage.local.get([
-      "recordingDuration",
-      "recordingTab",
-      "lastRecordingBackendRef",
-    ]);
+  const {
+    recordingDuration,
+    recordingTab,
+    lastRecordingBackendRef,
+    recording,
+  } = await chrome.storage.local.get([
+    "recordingDuration",
+    "recordingTab",
+    "lastRecordingBackendRef",
+    "recording",
+  ]);
   diagEvent("sw-received-video-ready", {
     recordingDurationMs: Number(recordingDuration) || 0,
   });
+
+  // Writer sets this fire-and-forget, but the discard path below kills that
+  // context first (marker set, key nulled 11s later), so re-assert it here.
+  // Skipped while recording since the file isn't finalized yet.
+  if (
+    lastRecordingBackendRef?.backend === "opfs" &&
+    lastRecordingBackendRef?.fileName &&
+    !recording
+  ) {
+    try {
+      await chrome.storage.local.set({
+        lastRecordingFinalizedFileName: lastRecordingBackendRef.fileName,
+      });
+    } catch {}
+  }
   chrome.runtime
     .sendMessage({
       type: "clear-recording-session-safe",

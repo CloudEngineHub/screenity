@@ -208,6 +208,7 @@ export const chooseTrackEncoder = async ({
   mimeType,
   videoBitsPerSecond,
   audioBitsPerSecond,
+  audioChannels,
   enableAudio,
   createMediaRecorder,
   onDataAvailable,
@@ -258,6 +259,7 @@ export const chooseTrackEncoder = async ({
     mimeType: "video/mp4",
     videoBitsPerSecond,
     audioBitsPerSecond,
+    audioChannels,
     enableAudio,
     preferSoftware:
       forceSoftware ||

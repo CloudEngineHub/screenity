@@ -96,18 +96,20 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (
-    !message ||
-    (message.type !== "remux-start" && message.type !== "webm-start")
-  ) {
+  const START_TYPES = {
+    "remux-start": "remux",
+    "webm-start": "webm",
+    "mp4x-start": "mp4x",
+  };
+  if (!message || !START_TYPES[message.type]) {
     return undefined;
   }
-  const { requestId, inputFileName, outputFileName } = message;
+  const { requestId, inputFileName, outputFileName, videoBitrate } = message;
   if (!requestId || !inputFileName || !outputFileName) {
     sendResponse({ ok: false, error: "invalid-remux-start-payload" });
     return false;
   }
-  const workerType = message.type === "webm-start" ? "webm" : "remux";
+  const workerType = START_TYPES[message.type];
   try {
     const w = ensureWorker();
     devLog("remux-start-received", {
@@ -122,6 +124,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       requestId,
       inputFileName,
       outputFileName,
+      videoBitrate,
     });
   } catch (err) {
     pending.delete(requestId);

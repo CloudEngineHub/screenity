@@ -214,11 +214,48 @@ export const getValidatedEditorTab = async ({
   };
 };
 
-export const resolveEditorTabForTarget = async ({
+// Concurrent callers each validated before any tab reference existed and opened
+// duplicates. Keyed by kind:projectId, the second caller awaits the first.
+const inFlightEditorOpens = new Map();
+
+export const resolveEditorTabForTarget = (args) => {
+  const parsedTarget = parseEditorTargetUrl(args?.targetUrl);
+  const key = [
+    args?.expectedKind || parsedTarget?.kind || "editor",
+    args?.expectedProjectId || parsedTarget?.projectId || args?.targetUrl || "",
+  ].join(":");
+  const pending = inFlightEditorOpens.get(key);
+  if (pending) {
+    // The key deliberately omits focus so concurrent callers still share one
+    // tab, but joining a focus:false run (forward-create-scene is the only one)
+    // would silently drop this caller's focus request and leave the editor in
+    // the background. Re-assert it on the tab the shared run resolved.
+    if (args?.focus === false) return pending;
+    return pending.then(async (res) => {
+      if (res?.tabId) {
+        await focusTab(res.tabId, {
+          reason: `${args?.reason || "unknown"}:joined`,
+          projectId: args?.expectedProjectId || null,
+          kind: args?.expectedKind || null,
+        });
+      }
+      return res;
+    });
+  }
+  const run = resolveEditorTabForTargetImpl(args).finally(() =>
+    inFlightEditorOpens.delete(key),
+  );
+  inFlightEditorOpens.set(key, run);
+  return run;
+};
+
+const resolveEditorTabForTargetImpl = async ({
   targetUrl,
   expectedProjectId = null,
   expectedKind = null,
   reason = "unknown",
+  // focus false: background open (forward-create-scene must not steal focus).
+  focus = true,
 }) => {
   const parsedTarget = parseEditorTargetUrl(targetUrl);
   const projectId = expectedProjectId || parsedTarget?.projectId || null;
@@ -231,26 +268,32 @@ export const resolveEditorTabForTarget = async ({
   });
 
   if (existing.ok && existing.tab?.id) {
+    if (!focus) {
+      return { tabId: existing.tab.id, reused: true, opened: false };
+    }
     const focused = await focusTab(existing.tab.id, {
       reason: `${reason}:reuse`,
       projectId,
       kind,
     });
-    if (focused) {
+    if (!focused) {
+      console.warn("[Screenity][BG] Failed to focus validated editor tab", {
+        reason,
+        tabId: existing.tab.id,
+        projectId,
+        kind,
+      });
+    } else {
       console.info("[Screenity][BG] Reusing validated editor tab", {
         reason,
         tabId: existing.tab.id,
         projectId,
         kind,
       });
-      return { tabId: existing.tab.id, reused: true, opened: false };
     }
-    console.warn("[Screenity][BG] Failed to focus validated editor tab", {
-      reason,
-      tabId: existing.tab.id,
-      projectId,
-      kind,
-    });
+    // Focus is best effort: tabs.update throws "Tabs cannot be edited right now"
+    // mid tab-drag, and falling through here opened a duplicate tab.
+    return { tabId: existing.tab.id, reused: true, opened: false };
   } else {
     console.info("[Screenity][BG] Stored editor tab not reusable", {
       reason,
@@ -269,7 +312,7 @@ export const resolveEditorTabForTarget = async ({
     return { tabId: null, reused: false, opened: false };
   }
 
-  const createdTab = await createTab(targetUrl, true);
+  const createdTab = await createTab(targetUrl, focus);
   if (!createdTab?.id) {
     console.warn("[Screenity][BG] Failed to open fallback editor tab", {
       reason,
@@ -286,11 +329,13 @@ export const resolveEditorTabForTarget = async ({
     source: `fallback-open:${reason}`,
     expectedProjectId: projectId,
   });
-  await focusTab(createdTab.id, {
-    reason: `${reason}:opened`,
-    projectId,
-    kind,
-  });
+  if (focus) {
+    await focusTab(createdTab.id, {
+      reason: `${reason}:opened`,
+      projectId,
+      kind,
+    });
+  }
 
   console.info("[Screenity][BG] Opened fallback editor tab", {
     reason,

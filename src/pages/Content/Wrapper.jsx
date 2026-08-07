@@ -120,10 +120,20 @@ const Wrapper = () => {
   const permissionsRef = useRef(null);
   const regionCaptureRef = useRef(null);
   const contentStateRef = useRef(contentState);
+  // Mount on first use, then keep it. Gating on drawingMode threw away the
+  // fabric instance (and its drawings) every time the toolbar closed; an
+  // unmounted canvas is already pointer-events:none, so staying mounted is free.
+  const [canvasEverOpened, setCanvasEverOpened] = useState(false);
 
   useEffect(() => {
     contentStateRef.current = contentState;
   }, [contentState]);
+
+  useEffect(() => {
+    if (contentState.drawingMode || contentState.blurMode) {
+      setCanvasEverOpened(true);
+    }
+  }, [contentState.drawingMode, contentState.blurMode]);
 
   // Delayed loader: only show after 800ms in a wait window
   // (pre-countdown setup or post-stop finalize), never during
@@ -386,10 +396,13 @@ const Wrapper = () => {
                 }}
               ></div>
             )}
-          {(contentState.drawingMode || contentState.blurMode) && (
+          {(canvasEverOpened ||
+            contentState.drawingMode ||
+            contentState.blurMode) && (
             // Key on multiSceneCount only: fresh fabric per scene,
             // but drawings persist through the pre-record → record
-            // transition within a scene.
+            // transition within a scene, and through the toolbar
+            // being closed and reopened.
             <Canvas key={`canvas-${contentState.multiSceneCount || 0}`} />
           )}
           <CursorModes />
