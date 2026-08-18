@@ -8,6 +8,7 @@ import { sendMessageRecord } from "../recording/sendMessageRecord.js";
 import { loginWithWebsite } from "../auth/loginWithWebsite.js";
 import { tryResumePendingUploads } from "../recording/resumePendingUploads";
 import { clearInMemoryEditorLock } from "../recording/stopRecording";
+import { sendMessageEnsuringContentScript } from "../utils/executeScripts";
 
 const CLOUD_FEATURES_ENABLED =
   process.env.SCREENITY_ENABLE_CLOUD_FEATURES === "true";
@@ -124,7 +125,7 @@ const openPlaygroundOrPopup = async (tab) => {
 
   // never gate on navigator.onLine; that caused duplicate playground tabs
   if (!isForbidden || isPlaygroundOrSetup) {
-    sendMessageTab(tab.id, { type: "toggle-popup" })
+    sendMessageEnsuringContentScript(tab.id, { type: "toggle-popup" })
       .then(() => console.log("[Screenity][ActionClick] toggle-popup delivered to tab", tab.id))
       .catch((err) => console.error("[Screenity][ActionClick] toggle-popup FAILED to tab", tab.id, String(err).slice(0, 120)));
     chrome.storage.local.set({ activeTab: tab.id });

@@ -20,6 +20,9 @@ export interface ConversionOptions {
   preferredVideoCodec?: VideoCodec;
   audioCodec?: AudioCodec;
   onProgress?: (progress: number) => void;
+  // Fires when the source had audio the output can't hold, so the caller can
+  // fall back instead of shipping a silent file.
+  onAudioDropped?: (reason: string, codec: string) => void;
   verbose?: boolean;
   // When provided (e.g. a StreamTarget writing to OPFS), output streams to it
   // and convert() resolves to null; the caller owns the written file. Used by
@@ -76,13 +79,13 @@ export class VideoConverter {
 
   async canEncodeCodec(codec: VideoCodec): Promise<boolean> {
     if (typeof VideoEncoder === "undefined") return false;
-    try {
-      const testConfig = this.getEncoderConfig(codec);
-      const support = await VideoEncoder.isConfigSupported(testConfig);
-      return support.supported ?? false;
-    } catch {
-      return false;
+    for (const testConfig of this.getEncoderConfigs(codec)) {
+      try {
+        const support = await VideoEncoder.isConfigSupported(testConfig);
+        if (support.supported) return true;
+      } catch {}
     }
+    return false;
   }
 
   clearCache(): void {
@@ -101,6 +104,7 @@ export class VideoConverter {
       preferredVideoCodec,
       audioCodec,
       onProgress,
+      onAudioDropped,
     } = options;
 
     const cache = targetFormat === "mp4" ? this.cachedMP4Codec : this.cachedWebMCodec;
@@ -144,6 +148,17 @@ export class VideoConverter {
       audio: { codec: finalAudioCodec, bitrate: audioBitrate },
     });
 
+    // mediabunny reports a conversion valid while silently discarding audio.
+    // Its own warning prints "[object Object]", so serialize the real reason.
+    if (onAudioDropped) {
+      const dropped = conversion.discardedTracks.find(
+        (t) => t.track.type === "audio"
+      );
+      if (dropped) {
+        onAudioDropped(String(dropped.reason), String(dropped.track.codec));
+      }
+    }
+
     if (!conversion.isValid) {
       const reasons = conversion.discardedTracks
         .map((t) => `${t.track.type}: ${t.reason}`)
@@ -166,15 +181,19 @@ export class VideoConverter {
     });
   }
 
-  private getEncoderConfig(codec: VideoCodec): VideoEncoderConfig {
+  private getEncoderConfigs(codec: VideoCodec): VideoEncoderConfig[] {
     const baseConfig = { width: 1920, height: 1080, bitrate: 5_000_000 };
     switch (codec) {
+      // Trailing byte is the H.264 level. Level 3.0 (1E) tops out near 720x576,
+      // so probing at 1080p always failed into HEVC on macOS, VP9 on Linux.
       case "avc":
-        return { ...baseConfig, codec: "avc1.42E01E" };
+        return ["avc1.64002A", "avc1.4D401F", "avc1.42E01E", "avc1.42001F"].map(
+          (c) => ({ ...baseConfig, codec: c })
+        );
       case "hevc":
-        return { ...baseConfig, codec: "hev1.1.6.L93.B0" };
+        return [{ ...baseConfig, codec: "hev1.1.6.L93.B0" }];
       default:
-        return { ...baseConfig, codec };
+        return [{ ...baseConfig, codec }];
     }
   }
 }

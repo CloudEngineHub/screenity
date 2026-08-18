@@ -5,6 +5,9 @@ import { startAfterCountdown } from "./startRecording";
 
 // 3s countdown + 1s END_HOLD_MS + POST_HIDE_START_DELAY_MS + slack
 const FALLBACK_AFTER_COUNTDOWN_STARTED_MS = 8000;
+// countdownStartedAt is never cleared, so on startup it can be days old. Past
+// this it's a phantom start, not recovery: a real SW restart lands in seconds.
+const FALLBACK_RECOVERY_CEILING_MS = 60000;
 
 let fallbackTimerId = null;
 
@@ -63,18 +66,43 @@ export const noteCountdownStarted = () => {
 // fallback dispatch synchronously if the deadline already passed.
 export const recoverPendingCountdownOnStartup = async () => {
   try {
-    const { pendingRecording, recording, restarting, countdownStartedAt } =
-      await chrome.storage.local.get([
-        "pendingRecording",
-        "recording",
-        "restarting",
-        "countdownStartedAt",
-      ]);
+    const {
+      pendingRecording,
+      recording,
+      restarting,
+      countdownStartedAt,
+      recordingStoppedAt,
+    } = await chrome.storage.local.get([
+      "pendingRecording",
+      "recording",
+      "restarting",
+      "countdownStartedAt",
+      "recordingStoppedAt",
+    ]);
     if (!pendingRecording || recording || restarting) return;
     const startedAt = Number(countdownStartedAt) || 0;
     if (!startedAt) return;
+    // A countdown that predates the last stop belongs to a finished recording.
+    // pendingRecording can be true from a start whose countdown hasn't ticked.
+    if (
+      typeof recordingStoppedAt === "number" &&
+      startedAt <= recordingStoppedAt
+    ) {
+      console.info(
+        "[Screenity][BG] recoverPendingCountdownOnStartup: countdown predates last stop, skipping",
+        { startedAt, recordingStoppedAt },
+      );
+      return;
+    }
     const elapsed = Date.now() - startedAt;
     if (elapsed < FALLBACK_AFTER_COUNTDOWN_STARTED_MS) return;
+    if (elapsed > FALLBACK_RECOVERY_CEILING_MS) {
+      console.info(
+        "[Screenity][BG] recoverPendingCountdownOnStartup: stale countdown, skipping",
+        { elapsedMs: elapsed },
+      );
+      return;
+    }
     console.info(
       "[Screenity][BG] recoverPendingCountdownOnStartup: SW restarted past countdown deadline, dispatching",
       { elapsedMs: elapsed },

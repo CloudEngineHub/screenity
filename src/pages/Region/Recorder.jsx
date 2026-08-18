@@ -41,6 +41,7 @@ import { chooseWriter } from "../Recorder/recorderStorage/chooseWriter";
 import { chooseReader } from "../Recorder/recorderStorage/chooseReader";
 import { lifecycle } from "../utils/lifecycleLog";
 import { perfMark, perfSpan } from "../utils/perfMarks";
+import { markStartProgress } from "../utils/startProgress";
 
 import localforage from "localforage";
 
@@ -930,7 +931,11 @@ const Recorder = () => {
       ]);
       const userSetting = resolveFastRecorderUserSetting(useWebCodecsRecorder);
       const stickyState = await getFastRecorderStickyState();
+      // Keeps the BG start-fail re-check from tearing down a slow encoder
+      // probe. Same heartbeat the tab/offscreen recorder writes.
+      markStartProgress("encoder-probe");
       const probeResult = await probeFastRecorderSupport();
+      markStartProgress("encoder-probe-done");
       const shouldUseFast = shouldUseFastRecorder(
         userSetting,
         probeResult,

@@ -24,6 +24,16 @@ import {
   setStartFlowOutcome,
 } from "../../utils/startFlowTrace";
 import { triggerSupportDownload } from "../../utils/triggerSupportDownload";
+import { apiIssueCopy } from "../utils/apiIssueCopy";
+
+// Re-asking can't change these, so the retry would only re-open the modal.
+// Anything else (a busy or still-waking device) is worth another pass.
+const PERMISSION_TERMINAL_ERRORS = new Set([
+  "NotAllowedError",
+  "NotFoundError",
+  "SecurityError",
+  "OverconstrainedError",
+]);
 
 export const contentStateContext = createContext();
 // Split out of contentStateContext: the 1s clock tick was re-rendering every
@@ -67,6 +77,9 @@ const ContentState = (props) => {
   );
   const startBeepRef = useRef(null);
   const stopBeepRef = useRef(null);
+  // True while the "can't reach Screenity" modal is the one on screen, so it
+  // can close itself when the API answers again.
+  const apiIssueModalRef = useRef(false);
   const prevRecordingRef = useRef(null);
   const hydratedRef = useRef(false);
   const suppressStopBeepRef = useRef(false);
@@ -372,6 +385,7 @@ const ContentState = (props) => {
       timeWarning: false,
       tabCaptureFrame: false,
       pipEnded: false,
+      pipActive: false,
       // Preserve tool state in multi so reopen-popup-multi can
       // carry it to the next scene.
       ...(isMulti
@@ -429,6 +443,7 @@ const ContentState = (props) => {
           timeWarning: false,
           tabCaptureFrame: false,
           pipEnded: false,
+          pipActive: false,
           showExtension: wasMulti ? true : false,
           showPopup: wasMulti ? true : true,
           // Preserve tool state in multi-mode (see editor-open cleanup
@@ -524,6 +539,7 @@ const ContentState = (props) => {
       pendingRecording: false,
       preparingRecording: false,
       pipEnded: false,
+      pipActive: false,
       blurMode: false,
       drawingMode: false,
       // Mirror the storage write to avoid a frame where the cursor overlay
@@ -665,7 +681,17 @@ const ContentState = (props) => {
         type: "check-storage-quota",
       });
 
-      const { success, canUpload, error } = storageResponse;
+      const { success, canUpload, error, reachability } = storageResponse;
+
+      if (reachability) {
+        // Always restamp: this verdict is live, and the banner treats an old
+        // `at` as unproven and hides itself.
+        setContentState((prev) => ({
+          ...prev,
+          apiReachability: reachability,
+          apiReachabilityAt: Date.now(),
+        }));
+      }
 
       if (success && canUpload === false) {
         contentStateRef.current.openModal(
@@ -697,19 +723,40 @@ const ContentState = (props) => {
           }));
         }
 
+        // Blaming the storage check for a dead connection or a 502 sends people
+        // to look at their storage settings. Name the real problem.
+        const issue = isAuthError ? null : apiIssueCopy(reachability);
+        const title = issue
+          ? issue.title
+          : chrome.i18n.getMessage("storageCheckFailTitle");
         const message = isAuthError
           ? chrome.i18n.getMessage("storageCheckFailAuthDescription")
-          : chrome.i18n.getMessage("storageCheckFailDescription");
+          : issue
+            ? issue.description
+            : chrome.i18n.getMessage("storageCheckFailDescription");
+
+        apiIssueModalRef.current = Boolean(issue);
 
         contentStateRef.current.openModal(
-          chrome.i18n.getMessage("storageCheckFailTitle"),
+          title,
           message,
-          chrome.i18n.getMessage("retryButtonLabel"),
+          isAuthError
+            ? chrome.i18n.getMessage("loginButtonLabel")
+            : chrome.i18n.getMessage("retryButtonLabel"),
           chrome.i18n.getMessage("closeModalLabel"),
-          async () => {
-            window.location.reload();
+          () => {
+            // Retry the start, not the page: the old reload dropped whatever
+            // the user had open and never re-ran the check.
+            apiIssueModalRef.current = false;
+            if (isAuthError) {
+              chrome.runtime.sendMessage({ type: "handle-login" });
+            } else {
+              startStreaming();
+            }
           },
-          () => {},
+          () => {
+            apiIssueModalRef.current = false;
+          },
         );
       }
 
@@ -872,6 +919,7 @@ const ContentState = (props) => {
 
             surface: "default",
             pipEnded: false,
+            pipActive: false,
           }));
         },
         () => {
@@ -923,6 +971,7 @@ const ContentState = (props) => {
 
         surface: "default",
         pipEnded: false,
+        pipActive: false,
       }));
     }
   }, [contentStateRef]);
@@ -974,12 +1023,22 @@ const ContentState = (props) => {
       const cameraPermission = data.cameraPermission;
       const microphonePermission = data.microphonePermission;
 
+      // Empty on a granted device is Chrome lagging, not an absent device.
+      // Keep the old list rather than show "None" until the page reloads.
       setContentState((prevContentState) => ({
         ...prevContentState,
-        audioInput: audioInput,
-        videoInput: videoInput,
+        audioInput:
+          microphonePermission && !audioInput?.length && prevContentState.audioInput?.length
+            ? prevContentState.audioInput
+            : audioInput,
+        videoInput:
+          cameraPermission && !videoInput?.length && prevContentState.videoInput?.length
+            ? prevContentState.videoInput
+            : videoInput,
         cameraPermission: cameraPermission,
         microphonePermission: microphonePermission,
+        // Wrapper watches this to know its request was answered.
+        permissionsResponses: (prevContentState.permissionsResponses || 0) + 1,
       }));
 
       const audioInputById = Array.isArray(audioInput)
@@ -1062,6 +1121,11 @@ const ContentState = (props) => {
         ...prevContentState,
         cameraPermission: false,
         microphonePermission: false,
+        // A settled refusal is still an answer. Without it the Wrapper retry
+        // reads the iframe as never having replied and re-runs the prompt.
+        permissionsResponses: PERMISSION_TERMINAL_ERRORS.has(data?.error)
+          ? (prevContentState.permissionsResponses || 0) + 1
+          : prevContentState.permissionsResponses || 0,
       }));
       if (contentStateRef.current.askForPermissions) {
         if (contentStateRef.current.sitePermissionsBlocked) {
@@ -1177,6 +1241,7 @@ const ContentState = (props) => {
     startStreaming: startStreaming,
     setToolbarMode: null,
     openModal: null,
+    closeModal: null,
     openToast: null,
     // Page-level Permissions-Policy disallows camera/mic. Lets us show a
     // site-specific warning instead of the misleading "check your permissions" one.
@@ -1260,12 +1325,16 @@ const ContentState = (props) => {
     useOffscreenCloud: true,
     isAddingImage: false,
     pipEnded: false,
+    pipActive: false,
     tabCaptureFrame: false,
     showOnboardingArrow: false,
     offline: false,
     updateChrome: false,
     permissionsChecked: false,
     permissionsLoaded: false,
+    permissionsResponses: 0,
+    apiReachability: "ok",
+    apiReachabilityAt: null,
     parentRef: null,
     shadowRef: null,
     settingsOpen: false,
@@ -1479,32 +1548,38 @@ const ContentState = (props) => {
     let timer = null;
     let fired = false;
 
+    // Bytes moving while the UI still waits means the recorder started and
+    // only the UI is stuck. Zero means the start itself never happened.
+    const reportStuck = async (state, timeoutMs) => {
+      if (fired) return;
+      fired = true;
+      let live = null;
+      try {
+        const snap = await chrome.storage.local.get(["recorderLiveProgress"]);
+        live = snap?.recorderLiveProgress || null;
+      } catch {}
+      setStartFlowOutcome("stuck", {
+        stuck: {
+          state,
+          since: Date.now() - timeoutMs,
+          durationMs: timeoutMs,
+          liveChunks: live?.chunks ?? null,
+          liveBytes: live?.bytes ?? null,
+          liveAt: live?.ts ?? null,
+        },
+      });
+    };
+
     if (
       contentState.pendingRecording &&
       !contentState.preparingRecording
     ) {
       timer = setTimeout(() => {
-        if (fired) return;
-        fired = true;
-        setStartFlowOutcome("stuck", {
-          stuck: {
-            state: "pending",
-            since: Date.now() - PENDING_TIMEOUT_MS,
-            durationMs: PENDING_TIMEOUT_MS,
-          },
-        });
+        reportStuck("pending", PENDING_TIMEOUT_MS);
       }, PENDING_TIMEOUT_MS);
     } else if (contentState.preparingRecording) {
       timer = setTimeout(() => {
-        if (fired) return;
-        fired = true;
-        setStartFlowOutcome("stuck", {
-          stuck: {
-            state: "preparing",
-            since: Date.now() - PREPARING_TIMEOUT_MS,
-            durationMs: PREPARING_TIMEOUT_MS,
-          },
-        });
+        reportStuck("preparing", PREPARING_TIMEOUT_MS);
       }, PREPARING_TIMEOUT_MS);
     }
 
@@ -1793,10 +1868,68 @@ const ContentState = (props) => {
     };
   }, []);
 
+  // Background records reachability from the API calls it already makes.
+  // The browser's own offline flag overrides it.
+  useEffect(() => {
+    const applyState = (state, at = Date.now()) => {
+      setContentState((prev) =>
+        prev.apiReachability === state && prev.apiReachabilityAt === at
+          ? prev
+          : { ...prev, apiReachability: state, apiReachabilityAt: at },
+      );
+    };
+
+    chrome.storage.local.get("apiReachability", (result) => {
+      if (navigator.onLine === false) {
+        applyState("offline");
+        return;
+      }
+      const stored = result?.apiReachability;
+      // Carry the timestamp: last night's outage is not evidence about now,
+      // and the banner refuses to run on a verdict that old.
+      applyState(stored?.state || "ok", stored?.at || Date.now());
+    });
+
+    const onOffline = () => applyState("offline");
+    const onOnline = () => {
+      applyState("ok");
+      chrome.runtime.sendMessage({ type: "recheck-api-reachability" }, (res) => {
+        if (chrome.runtime.lastError) return;
+        if (res?.state) applyState(res.state);
+      });
+    };
+
+    window.addEventListener("offline", onOffline);
+    window.addEventListener("online", onOnline);
+    return () => {
+      window.removeEventListener("offline", onOffline);
+      window.removeEventListener("online", onOnline);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (contentState.apiReachability !== "ok") return;
+    if (!apiIssueModalRef.current) return;
+    apiIssueModalRef.current = false;
+    contentState.closeModal?.();
+  }, [contentState.apiReachability, contentState.closeModal]);
+
   useEffect(() => {
     const onChanged = (changes, area) => {
       if (area !== "local") return;
       let shouldUpdateTimer = false;
+
+      if (changes.apiReachability) {
+        const next = changes.apiReachability.newValue;
+        const state = next?.state || "ok";
+        const at = next?.at || Date.now();
+        setContentState((prev) =>
+          (prev.apiReachability === state && prev.apiReachabilityAt === at) ||
+          navigator.onLine === false
+            ? prev
+            : { ...prev, apiReachability: state, apiReachabilityAt: at },
+        );
+      }
 
       if (changes.activeTab) {
         activeTabRef.current = changes.activeTab.newValue ?? null;
@@ -1950,6 +2083,7 @@ const ContentState = (props) => {
                 timeWarning: false,
                 tabCaptureFrame: false,
                 pipEnded: false,
+                pipActive: false,
                 showExtension: wasMulti ? true : false,
                 showPopup: wasMulti ? true : true,
                 // Preserve tool state in multi so the user's drawing

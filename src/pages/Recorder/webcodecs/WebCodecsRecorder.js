@@ -1199,6 +1199,19 @@ export class WebCodecsRecorder {
     this._stopping = false;
   }
 
+  // cleanup() nulls _videoStartUs, so this reads null once it has run. The
+  // finalize-time capture in WebCodecsTrackRecorder lands before that.
+  _effectiveOutputFps() {
+    if (this._videoStartUs == null || !(this.frameCount > 0)) return null;
+    let pausedUs = this.totalPausedDurationUs || 0;
+    if (this.paused && this.pauseStartUs != null) {
+      pausedUs += performance.now() * 1000 - this.pauseStartUs;
+    }
+    const elapsedUs = performance.now() * 1000 - this._videoStartUs - pausedUs;
+    if (!(elapsedUs > 0)) return null;
+    return Math.round((this.frameCount / (elapsedUs / 1e6)) * 100) / 100;
+  }
+
   // Readable at any time: stop() early-returns once the recorder isn't
   // running, so onFinalized is missing on exactly the sessions worth
   // explaining (zero-frame exit, spent stall budget, failed start).
@@ -1222,6 +1235,9 @@ export class WebCodecsRecorder {
       ),
       // Submissions to encode(), not muxer output (that's chunksOut).
       framesEncoded: this.frameCount ?? null,
+      // framesEncoded over elapsed capture time, pause excluded so a paused
+      // session doesn't read as a slow encoder.
+      effectiveOutputFps: this._effectiveOutputFps(),
       chunksOut: this._chunksOut ?? null,
       steadyQueueCap: this._encoderMaxQueueSize ?? null,
       // Drops inside the startup window were judged against this, not the

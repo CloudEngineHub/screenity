@@ -15,6 +15,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
 const MANIFEST_PATH = join(ROOT, "src", "manifest.json");
 const PACKAGE_PATH = join(ROOT, "package.json");
+const LOCK_PATH = join(ROOT, "package-lock.json");
 const BUILD_DIR = join(ROOT, "build");
 const ZIP_PATH = join(ROOT, "build.zip");
 
@@ -90,7 +91,24 @@ manifest.version = nextVersion;
 pkg.version = nextVersion;
 writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2) + "\n");
 writeFileSync(PACKAGE_PATH, JSON.stringify(pkg, null, 2) + "\n");
-console.log("Wrote manifest.json + package.json.\n");
+
+// Patch the lockfile's two version fields in place. `npm install
+// --package-lock-only` would re-resolve deps inside their ranges too.
+let lockNote = "";
+try {
+  const lock = JSON.parse(readFileSync(LOCK_PATH, "utf8"));
+  lock.version = nextVersion;
+  if (lock.packages && lock.packages[""]) {
+    lock.packages[""].version = nextVersion;
+  }
+  writeFileSync(LOCK_PATH, JSON.stringify(lock, null, 2) + "\n");
+  lockNote = " + package-lock.json";
+} catch (err) {
+  console.warn(
+    `Warning: could not update package-lock.json version (${err?.message || err}).`,
+  );
+}
+console.log(`Wrote manifest.json + package.json${lockNote}.\n`);
 
 console.log("Running source hygiene check...");
 try {

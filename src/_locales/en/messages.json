@@ -539,6 +539,22 @@
     "message": "Try again",
     "description": "Offline label try again button"
   },
+  "serverIssueTitle": {
+    "message": "Screenity is unavailable",
+    "description": "Title shown when the Screenity API is returning server errors"
+  },
+  "serverIssueDescription": {
+    "message": "Cloud recording isn't available right now. Please try again shortly.",
+    "description": "Description shown when the Screenity API is returning server errors"
+  },
+  "serverUnreachableTitle": {
+    "message": "Can't reach Screenity",
+    "description": "Title shown when the Screenity API cannot be reached"
+  },
+  "serverUnreachableDescription": {
+    "message": "Please check your connection or try again in a moment.",
+    "description": "Description shown when the Screenity API cannot be reached"
+  },
   "updateChromeLabelTitle": {
     "message": "Chrome needs to be updated",
     "description": "Update Chrome label"

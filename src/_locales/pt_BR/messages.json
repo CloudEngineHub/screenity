@@ -551,6 +551,22 @@
     "message": "Tentar novamente",
     "description": "Botão de tentar novamente do rótulo de offline"
   },
+  "serverIssueTitle": {
+    "message": "O Screenity está indisponível",
+    "description": "Title shown when the Screenity API is returning server errors"
+  },
+  "serverIssueDescription": {
+    "message": "A gravação na nuvem está indisponível no momento. Tente novamente em instantes.",
+    "description": "Description shown when the Screenity API is returning server errors"
+  },
+  "serverUnreachableTitle": {
+    "message": "Não foi possível conectar ao Screenity",
+    "description": "Title shown when the Screenity API cannot be reached"
+  },
+  "serverUnreachableDescription": {
+    "message": "Verifique sua conexão ou tente novamente em instantes.",
+    "description": "Description shown when the Screenity API cannot be reached"
+  },
   "updateChromeLabelTitle": {
     "message": "O Chrome precisa ser atualizado",
     "description": "Rótulo de atualizar o Chrome"

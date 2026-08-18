@@ -551,6 +551,22 @@
     "message": "Coba lagi",
     "description": "Tombol Coba lagi label Offline"
   },
+  "serverIssueTitle": {
+    "message": "Screenity tidak tersedia",
+    "description": "Title shown when the Screenity API is returning server errors"
+  },
+  "serverIssueDescription": {
+    "message": "Perekaman cloud tidak tersedia saat ini. Coba lagi sebentar lagi.",
+    "description": "Description shown when the Screenity API is returning server errors"
+  },
+  "serverUnreachableTitle": {
+    "message": "Tidak dapat terhubung ke Screenity",
+    "description": "Title shown when the Screenity API cannot be reached"
+  },
+  "serverUnreachableDescription": {
+    "message": "Periksa koneksi Anda atau coba lagi sebentar lagi.",
+    "description": "Description shown when the Screenity API cannot be reached"
+  },
   "updateChromeLabelTitle": {
     "message": "Chrome perlu diperbarui",
     "description": "Label Perbarui Chrome"

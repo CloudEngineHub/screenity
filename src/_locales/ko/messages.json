@@ -551,6 +551,22 @@
     "message": "다시 시도",
     "description": "Offline label try again button"
   },
+  "serverIssueTitle": {
+    "message": "Screenity를 사용할 수 없습니다",
+    "description": "Title shown when the Screenity API is returning server errors"
+  },
+  "serverIssueDescription": {
+    "message": "지금은 클라우드 녹화를 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+    "description": "Description shown when the Screenity API is returning server errors"
+  },
+  "serverUnreachableTitle": {
+    "message": "Screenity에 연결할 수 없습니다",
+    "description": "Title shown when the Screenity API cannot be reached"
+  },
+  "serverUnreachableDescription": {
+    "message": "연결 상태를 확인하거나 잠시 후 다시 시도해 주세요.",
+    "description": "Description shown when the Screenity API cannot be reached"
+  },
   "updateChromeLabelTitle": {
     "message": "Chrome을 업데이트해야 합니다",
     "description": "Update Chrome label"

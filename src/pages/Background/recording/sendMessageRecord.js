@@ -5,6 +5,10 @@ import { diagEvent } from "../../utils/diagnosticLog";
 // `offscreen` flag, look for a live recorder offscreen doc before giving up.
 const ENABLE_RESILIENT_HANDOFF = true;
 
+// Always false: "message port closed" can come from any context that got the
+// broadcast and didn't reply (camera page). Only sendResponse confirms delivery.
+const isDeliveredWithoutReply = () => false;
+
 export const sendMessageRecord = (message, responseCallback = null) => {
   return new Promise((resolve, reject) => {
     chrome.storage.local.get(["recordingTab", "offscreen"], (result) => {
@@ -18,8 +22,11 @@ export const sendMessageRecord = (message, responseCallback = null) => {
 
       if (result.offscreen) {
         chrome.runtime.sendMessage(message, (response) => {
-          if (chrome.runtime.lastError) {
-            reject(chrome.runtime.lastError.message);
+          const err = chrome.runtime.lastError?.message;
+          if (err && !isDeliveredWithoutReply(err)) {
+            reject(err);
+          } else if (err) {
+            resolve(undefined);
           } else {
             responseCallback ? responseCallback(response) : resolve(response);
           }
@@ -41,8 +48,11 @@ export const sendMessageRecord = (message, responseCallback = null) => {
       } else {
         const sendViaOffscreen = () => {
           chrome.runtime.sendMessage(message, (response) => {
-            if (chrome.runtime.lastError) {
-              reject(chrome.runtime.lastError.message);
+            const err = chrome.runtime.lastError?.message;
+            if (err && !isDeliveredWithoutReply(err)) {
+              reject(err);
+            } else if (err) {
+              resolve(undefined);
             } else {
               responseCallback ? responseCallback(response) : resolve(response);
             }

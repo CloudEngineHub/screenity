@@ -105,13 +105,12 @@ const entryPoints = {
     "RemuxOffscreen",
     "index.js"
   ),
-  remuxworker: path.join(
-    __dirname,
-    "src",
-    "pages",
-    "RemuxOffscreen",
-    "worker.js"
-  ),
+  // chunkLoading: a worker has no document, so the default DOM script-tag
+  // loader would throw on the lazy AAC encoder import.
+  remuxworker: {
+    import: path.join(__dirname, "src", "pages", "RemuxOffscreen", "worker.js"),
+    chunkLoading: "import-scripts",
+  },
   recorderopfsworker: path.join(
     __dirname,
     "src",

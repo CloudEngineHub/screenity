@@ -1,4 +1,5 @@
 import { sendMessageTab } from "../tabManagement";
+import { sendMessageEnsuringContentScript } from "../utils/executeScripts";
 
 export const handleTabActivation = async (activeInfo) => {
   try {
@@ -48,10 +49,12 @@ export const handleTabActivation = async (activeInfo) => {
 
       // Check if it's region or customRegion recording
       if (!region && !customRegion && recordingType !== "region") {
-        sendMessageTab(activeInfo.tabId, {
+        // The backfill may not have reached this tab yet, and it needs the
+        // script before it can show the toolbar.
+        sendMessageEnsuringContentScript(activeInfo.tabId, {
           type: "recording-check",
           recordingStartTime,
-        });
+        }).catch(() => {});
       }
     } else if (!isActivelyRecording && !restarting && !pendingRecording) {
       sendMessageTab(activeInfo.tabId, { type: "recording-ended" });

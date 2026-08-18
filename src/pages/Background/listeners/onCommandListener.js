@@ -1,5 +1,6 @@
 import { sendMessageTab, getCurrentTab } from "../tabManagement";
 import { sendMessageRecord } from "../recording/sendMessageRecord.js";
+import { sendMessageEnsuringContentScript } from "../utils/executeScripts";
 
 export const onCommandListener = () => {
   let lastToggleDrawingAt = 0;
@@ -34,7 +35,9 @@ export const onCommandListener = () => {
         !tabUrl.includes("chrome.google.com/webstore") &&
         !tabUrl.includes("chromewebstore.google.com")
       ) {
-        sendMessageTab(activeTab.id, { type: "start-stream" });
+        sendMessageEnsuringContentScript(activeTab.id, {
+          type: "start-stream",
+        }).catch(() => {});
       } else {
         chrome.tabs
           .create({

@@ -253,27 +253,61 @@ const Wrapper = () => {
     }));
   }, [regionCaptureRef.current]);
 
+  // The iframe unmounts with the popup, so drop the loaded flag with it.
+  // Otherwise the next open would post into a window that hasn't loaded yet.
   useEffect(() => {
-    if (contentState.permissionsChecked) return;
-    if (!permissionsRef.current) return;
+    if (contentState.showExtension) return;
+    setContentState((prevContentState) =>
+      prevContentState.permissionsLoaded
+        ? { ...prevContentState, permissionsLoaded: false }
+        : prevContentState
+    );
+  }, [contentState.showExtension]);
+
+  // A single request gets lost while the iframe loads or a device wakes, leaving
+  // the dropdowns on "No camera". A failed answer reports no permission at all.
+  useEffect(() => {
     if (!contentState.showExtension) return;
     if (!contentState.permissionsLoaded) return;
+    if (!permissionsRef.current) return;
 
-    permissionsRef.current.contentWindow.postMessage(
-      {
-        type: "screenity-get-permissions",
-      },
-      "*"
+    const startCount = contentStateRef.current.permissionsResponses || 0;
+    let attempts = 0;
+    let timer = null;
+
+    const request = () => {
+      permissionsRef.current?.contentWindow?.postMessage(
+        {
+          type: "screenity-get-permissions",
+        },
+        "*"
+      );
+      attempts += 1;
+      timer = setTimeout(retry, 1200 * attempts);
+    };
+
+    const retry = () => {
+      if ((contentStateRef.current.permissionsResponses || 0) !== startCount)
+        return;
+      if (attempts >= 3) return;
+      request();
+    };
+
+    request();
+
+    setContentState((prevContentState) =>
+      prevContentState.permissionsChecked
+        ? prevContentState
+        : { ...prevContentState, permissionsChecked: true }
     );
 
-    setContentState((prevContentState) => ({
-      ...prevContentState,
-      permissionsChecked: true,
-    }));
+    return () => {
+      if (timer) clearTimeout(timer);
+    };
   }, [
-    permissionsRef.current,
     contentState.showExtension,
     contentState.permissionsLoaded,
+    contentState.showPopup,
   ]);
 
   useEffect(() => {

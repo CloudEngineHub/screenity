@@ -374,6 +374,7 @@ const ToolbarWrap = () => {
     setContentState((prevContentState) => ({
       ...prevContentState,
       pipEnded: true,
+      pipActive: false,
     }));
   };
 

@@ -1,6 +1,7 @@
 import JSZip from "jszip";
 import { registerMessage } from "../../../messaging/messageRouter";
 import { appendUploadTelemetryEventSerialized } from "../utils/serializedTelemetryStore";
+import { noteApiError, noteApiResponse } from "../utils/apiReachability";
 import { perfMark, perfSpan } from "../../utils/perfMarks";
 import {
   focusTab,
@@ -572,17 +573,66 @@ const handleReopenPopupMulti = async () => {
   }
 };
 
-const handleCheckStorageQuota = async (retried = false) => {
+// This check blocks the whole start flow, so a dropped connection or a cold
+// server can't become a modal on the first try.
+const QUOTA_TIMEOUT_MS = 8000;
+const QUOTA_NETWORK_RETRY_DELAYS_MS = [400, 1200];
+
+const isNetworkError = (err) =>
+  err instanceof TypeError ||
+  err?.name === "AbortError" ||
+  err?.name === "TimeoutError";
+
+const fetchStorageQuota = async (token) => {
+  let lastErr = null;
+  for (let i = 0; i <= QUOTA_NETWORK_RETRY_DELAYS_MS.length; i += 1) {
+    if (i > 0) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, QUOTA_NETWORK_RETRY_DELAYS_MS[i - 1]),
+      );
+    }
+    try {
+      return await fetch(`${API_BASE}/storage/quota`, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+        credentials: "include",
+        signal: AbortSignal.timeout(QUOTA_TIMEOUT_MS),
+      });
+    } catch (err) {
+      lastErr = err;
+      if (!isNetworkError(err)) break;
+    }
+  }
+  throw lastErr;
+};
+
+// Single attempt, no retry ladder: the banner checks whether the API is back
+// and the full ladder reads as stuck. 8s matches the start path.
+const probeApiReachability = async () => {
   try {
     const { screenityToken } = await chrome.storage.local.get("screenityToken");
-
     const res = await fetch(`${API_BASE}/storage/quota`, {
       method: "GET",
       headers: {
         Authorization: `Bearer ${screenityToken}`,
       },
       credentials: "include",
+      signal: AbortSignal.timeout(QUOTA_TIMEOUT_MS),
     });
+    return await noteApiResponse(res);
+  } catch (err) {
+    return await noteApiError(err);
+  }
+};
+
+const handleCheckStorageQuota = async (retried = false) => {
+  try {
+    const { screenityToken } = await chrome.storage.local.get("screenityToken");
+
+    const res = await fetchStorageQuota(screenityToken);
+    await noteApiResponse(res);
 
     // 401: invalidate auth cache so loginWithWebsite refreshes the token
     if (res.status === 401 && !retried) {
@@ -594,19 +644,32 @@ const handleCheckStorageQuota = async (retried = false) => {
       return { success: false, error: "Not authenticated" };
     }
 
-    const result = await res.json();
+    // Gateway errors answer with HTML. An uncaught parse throw would
+    // masquerade as a network failure.
+    let result = null;
+    try {
+      result = await res.json();
+    } catch {}
 
     if (!res.ok) {
       return {
         success: false,
-        error: result?.error || "Fetch failed",
+        error: result?.error || `Request failed (${res.status})`,
+        reachability: res.status >= 500 ? "server" : "ok",
       };
     }
 
     return { success: true, ...result };
   } catch (err) {
     console.error("❌ Error checking storage quota:", err);
-    return { success: false, error: err.message };
+    const state = await noteApiError(err);
+    return {
+      success: false,
+      error: isNetworkError(err)
+        ? "Network unavailable"
+        : err.message || "Fetch failed",
+      reachability: state,
+    };
   }
 };
 
@@ -2204,6 +2267,18 @@ export const setupHandlers = () => {
       const response = await handleCheckStorageQuota();
       sendResponse(response);
 
+      return true;
+    },
+  );
+  registerMessage(
+    "recheck-api-reachability",
+    async (message, sender, sendResponse) => {
+      if (!CLOUD_FEATURES_ENABLED) {
+        sendResponse({ state: "ok" });
+        return true;
+      }
+      const state = await probeApiReachability();
+      sendResponse({ state });
       return true;
     },
   );

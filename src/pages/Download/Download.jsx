@@ -3,6 +3,11 @@ import React, { useState, useCallback, useEffect } from "react";
 import localforage from "localforage";
 import { openExistingChunksStore } from "../CloudRecorder/recorderStorage/chooseChunksStore";
 import { destroySessionDir } from "../CloudRecorder/recorderStorage/opfsKvStore";
+import {
+  MP4_CONTAINER,
+  containerFromMime,
+  containerFromFileName,
+} from "../utils/downloadContainer";
 
 localforage.config({
   driver: localforage.INDEXEDDB,
@@ -10,8 +15,8 @@ localforage.config({
   version: 1,
 });
 
-// Default IDB instances for legacy paths (recover-indexed-db, recover-indexed-db-mp4)
-// that don't go through CloudRecorder's per-session backend choice.
+// Default IDB instances for the legacy recover-indexed-db-mp4 path that
+// doesn't go through CloudRecorder's per-session backend choice.
 const chunksStore = localforage.createInstance({ name: "chunks" });
 const cameraChunksStore = localforage.createInstance({ name: "cameraChunks" });
 const audioChunksStore = localforage.createInstance({ name: "audioChunks" });
@@ -69,26 +74,6 @@ const Download = () => {
           URL.revokeObjectURL(url);
           window.close();
         });
-    } else if (message.type === "recover-indexed-db") {
-      const chunkArray = [];
-      chunksStore
-        .iterate((value, key, iterationNumber) => {
-          chunkArray.push(value.chunk);
-        })
-        .then(() => {
-          const blob = new Blob(chunkArray, { type: "video/webm" });
-          const url = URL.createObjectURL(blob);
-          chrome.downloads
-            .download({
-              url: url,
-              filename: "recovered-video.webm",
-              saveAs: true,
-            })
-            .then(() => {
-              URL.revokeObjectURL(url);
-              window.close();
-            });
-        });
     } else if (message.type === "recover-cloud-indexed-db") {
       (async () => {
         const ts = new Date().toISOString().replace(/[:.]/g, "-");
@@ -128,7 +113,7 @@ const Download = () => {
 
         // Per-track container drives the recovery-file extension. Sessions
         // recorded under WebCodecs put screen+camera in fragmented MP4;
-        // older / fallback sessions stay on WebM. Audio stays on WebM.
+        // older / fallback sessions stay on WebM. Audio is mp4 or webm.
         const containers = prefetchedSession?.trackContainers || {
           screen: "video/webm",
           camera: "video/webm",
@@ -138,7 +123,8 @@ const Download = () => {
           c === "video/mp4" ? "mp4" : "webm";
         const screenExt = containerToExt(containers.screen);
         const cameraExt = containerToExt(containers.camera);
-        const audioExt = "webm";
+        const audioIsMp4 = containers.audio === "audio/mp4";
+        const audioExt = audioIsMp4 ? "m4a" : "webm";
 
         // Clear only tracks that actually downloaded — without this a
         // failing track keeps ALL chunks, so retry re-downloads the
@@ -183,7 +169,12 @@ const Download = () => {
           containers.camera || "video/webm",
           cameraExt,
         );
-        await downloadTrack(audioStore, "Audio", "audio/webm", audioExt);
+        await downloadTrack(
+          audioStore,
+          "Audio",
+          audioIsMp4 ? "audio/mp4" : "audio/webm",
+          audioExt,
+        );
 
         // Let the download manager fetch the blob URLs first.
         await new Promise((r) => setTimeout(r, 2000));
@@ -260,6 +251,7 @@ const Download = () => {
       // modal silently failed.
       (async () => {
         let blob = null;
+        let container = MP4_CONTAINER;
         try {
           const { lastRecordingBackendRef } = await chrome.storage.local.get([
             "lastRecordingBackendRef",
@@ -275,7 +267,11 @@ const Download = () => {
               );
               const file = await handle.getFile();
               if (file && file.size > 0) {
-                blob = new Blob([file], { type: "video/mp4" });
+                container = containerFromFileName(
+                  lastRecordingBackendRef.fileName,
+                  MP4_CONTAINER,
+                );
+                blob = new Blob([file], { type: container.mime });
               }
             } catch (err) {
               console.warn(
@@ -293,9 +289,13 @@ const Download = () => {
             });
             chunkArray.sort((a, b) => a.index - b.index);
             if (chunkArray.length > 0) {
+              container = containerFromMime(
+                chunkArray[0]?.chunk?.type,
+                MP4_CONTAINER,
+              );
               blob = new Blob(
                 chunkArray.map((entry) => entry.chunk),
-                { type: "video/mp4" },
+                { type: container.mime },
               );
             }
           }
@@ -308,7 +308,7 @@ const Download = () => {
           return;
         }
         const url = URL.createObjectURL(blob);
-        const filename = `screenity-recording-${Date.now()}.mp4`;
+        const filename = `screenity-recording-${Date.now()}.${container.ext}`;
         try {
           await chrome.downloads.download({
             url,

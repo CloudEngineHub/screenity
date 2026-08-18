@@ -122,31 +122,21 @@ const CameraWrap = (props) => {
     };
   }, []);
 
+  const idle = !contentState.recording && !contentState.pendingRecording;
+  // Keyed off the real PiP window, not `surface`, which arrives only after an
+  // auth round-trip. pipActive false until "pip-started" keeps the bubble.
+  const hidden =
+    !idle &&
+    (contentState.pipActive ||
+      (contentState.isSubscribed &&
+        (!contentState.instantMode || contentState.multiMode)) ||
+      contentState.onboarding);
+
   return (
     <div
       style={{
-        visibility:
-          !contentState.recording && !contentState.pendingRecording
-            ? "visible"
-            : (!contentState.pipEnded &&
-                contentState.surface === "monitor" &&
-                (contentState.pendingRecording || contentState.recording)) ||
-              (contentState.isSubscribed &&
-                (!contentState.instantMode || contentState.multiMode)) ||
-              contentState.onboarding
-            ? "hidden"
-            : "visible",
-        pointerEvents:
-          !contentState.recording && !contentState.pendingRecording
-            ? "auto"
-            : (!contentState.pipEnded &&
-                contentState.surface === "monitor" &&
-                (contentState.pendingRecording || contentState.recording)) ||
-              (contentState.isSubscribed &&
-                (!contentState.instantMode || contentState.multiMode)) ||
-              contentState.onboarding
-            ? "none"
-            : "auto",
+        visibility: hidden ? "hidden" : "visible",
+        pointerEvents: hidden ? "none" : "auto",
       }}
     >
       <Rnd

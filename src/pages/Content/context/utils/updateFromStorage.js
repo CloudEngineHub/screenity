@@ -18,8 +18,8 @@ const deriveCursorMode = (effects, fallbackMode) => {
 export const updateFromStorage = (check = true, id = null) => {
   chrome.storage.local.get(
     [
-      "audioInput",
-      "videoInput",
+      "audioinput",
+      "videoinput",
       "defaultAudioInput",
       "defaultVideoInput",
       "defaultAudioInputLabel",
@@ -94,14 +94,14 @@ export const updateFromStorage = (check = true, id = null) => {
 
       setContentState((prevContentState) => ({
         ...prevContentState,
-        audioInput:
-          result.audioInput !== undefined && result.audioInput !== null
-            ? result.audioInput
-            : prevContentState.audioInput,
-        videoInput:
-          result.videoInput !== undefined && result.videoInput !== null
-            ? result.videoInput
-            : prevContentState.videoInput,
+        // Permissions.html writes these lowercase. Seeding from the cache keeps
+        // the dropdowns populated when the live enumeration is slow or fails.
+        audioInput: Array.isArray(result.audioinput)
+          ? result.audioinput
+          : prevContentState.audioInput,
+        videoInput: Array.isArray(result.videoinput)
+          ? result.videoinput
+          : prevContentState.videoInput,
         defaultAudioInput:
           result.defaultAudioInput !== undefined &&
           result.defaultAudioInput !== null

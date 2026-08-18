@@ -66,6 +66,15 @@ const FAST_RECORDER_KEYS = [
   "lastFailedValidation",
   "webcodecsConstructSnapshot",
   "recorderStartTimings",
+  // Names the startup step a dead start hung on.
+  "recorderStartProgress",
+  // Chunks and bytes captured so far. Splits a stuck UI from a dead start.
+  "recorderLiveProgress",
+  // offscreen-diag carries this too but is console-only, so a start that
+  // died on stream acquisition was unreadable from a zip.
+  "lastStreamAcquireError",
+  // Which start-dispatch branch ran (offscreen gDM, pre-acquired tab, picker).
+  "lastStartDispatchBranch",
   "countdownFinishedAt",
   "lastStartRecordingCaller",
   "lastCountdownFinishedDecision",
@@ -165,6 +174,9 @@ export const buildDiagnosticZip = async ({
       devicePixelRatio: window.devicePixelRatio,
     },
     deviceMemory: navigator.deviceMemory || null,
+    // Tells a localhost dev build apart from a store build when a report says
+    // an API call just failed to fetch.
+    apiBase: process.env.SCREENITY_API_BASE_URL || null,
   });
 
   files["config.json"] = JSON.stringify({

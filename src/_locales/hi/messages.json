@@ -551,6 +551,22 @@
     "message": "फिर से प्रयास करें",
     "description": "ऑफ़लाइन लेबल पुनः प्रयास करें बटन"
   },
+  "serverIssueTitle": {
+    "message": "Screenity उपलब्ध नहीं है",
+    "description": "Title shown when the Screenity API is returning server errors"
+  },
+  "serverIssueDescription": {
+    "message": "क्लाउड रिकॉर्डिंग अभी उपलब्ध नहीं है। कुछ देर बाद फिर प्रयास करें।",
+    "description": "Description shown when the Screenity API is returning server errors"
+  },
+  "serverUnreachableTitle": {
+    "message": "Screenity से कनेक्ट नहीं हो पा रहा",
+    "description": "Title shown when the Screenity API cannot be reached"
+  },
+  "serverUnreachableDescription": {
+    "message": "अपना कनेक्शन जांचें या कुछ देर बाद फिर प्रयास करें।",
+    "description": "Description shown when the Screenity API cannot be reached"
+  },
   "updateChromeLabelTitle": {
     "message": "क्रोम को अपडेट करने की आवश्यकता है",
     "description": "क्रोम अपडेट लेबल"

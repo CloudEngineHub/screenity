@@ -551,6 +551,22 @@
     "message": "Yeniden Deneyin",
     "description": "Çevrimdışı etiketi tekrar deneme düğmesi"
   },
+  "serverIssueTitle": {
+    "message": "Screenity kullanılamıyor",
+    "description": "Title shown when the Screenity API is returning server errors"
+  },
+  "serverIssueDescription": {
+    "message": "Bulut kaydı şu anda kullanılamıyor. Lütfen birazdan tekrar deneyin.",
+    "description": "Description shown when the Screenity API is returning server errors"
+  },
+  "serverUnreachableTitle": {
+    "message": "Screenity'ye ulaşılamıyor",
+    "description": "Title shown when the Screenity API cannot be reached"
+  },
+  "serverUnreachableDescription": {
+    "message": "Lütfen bağlantınızı kontrol edin veya birazdan tekrar deneyin.",
+    "description": "Description shown when the Screenity API cannot be reached"
+  },
   "updateChromeLabelTitle": {
     "message": "Chrome güncellenmesi gerekiyor",
     "description": "Chrome güncelleme etiketi"

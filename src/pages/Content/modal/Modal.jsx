@@ -56,16 +56,22 @@ const Modal = (props) => {
     }
   );
 
+  const closeModal = useCallback(() => {
+    setShowModal(false);
+  }, []);
+
   useEffect(() => {
     setContentState((prevContentState) => ({
       ...prevContentState,
       openModal: openModal,
+      closeModal: closeModal,
     }));
 
     return () => {
       setContentState((prevContentState) => ({
         ...prevContentState,
         openModal: null,
+        closeModal: null,
       }));
     };
   }, []);

@@ -165,6 +165,14 @@ const Dropdown = (props) => {
   };
 
   const clickedIcon = useRef(false);
+  // Guards onOpenChange while the icon handles its own click. Cleared next tick
+  // because onClick runs after onMouseUp, which left the flag stuck true.
+  const guardIconClick = () => {
+    clickedIcon.current = true;
+    setTimeout(() => {
+      clickedIcon.current = false;
+    }, 0);
+  };
 
   return (
     <Select.Root
@@ -260,7 +268,7 @@ const Dropdown = (props) => {
             e.stopPropagation();
             e.preventDefault();
             setOpen(false);
-            clickedIcon.current = true;
+            guardIconClick();
           }}
           onMouseDown={(e) => {
             e.stopPropagation();
@@ -278,7 +286,7 @@ const Dropdown = (props) => {
               e.stopPropagation();
               setOpen(false);
               toggleActive(e);
-              clickedIcon.current = true;
+              guardIconClick();
             }}
             onMouseDown={(e) => {
               e.stopPropagation();

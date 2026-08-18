@@ -1,6 +1,19 @@
 const JOURNAL_KEY_PREFIX = "uploadJournal-";
 const MAX_RESUME_ATTEMPTS = 5;
 const RESUME_LOCK_TTL_MS = 10 * 60 * 1000;
+// `recording` flips false before the host has drained and finalized. Resuming
+// inside that window puts two writers on one Bunny video.
+const ACTIVE_PIPELINE_STEPS = new Set([
+  "recording-starting",
+  "uploaders-initializing",
+  "uploaders-ready",
+  "recording",
+  "finalizing",
+  "scene-creating",
+  "scene-recovering",
+]);
+// Bounded so a host that died mid-drain can't block resume for good.
+const PIPELINE_ACTIVE_TTL_MS = 2 * 60 * 1000;
 
 const getAllStorage = () =>
   new Promise((resolve) => {
@@ -11,13 +24,23 @@ const getAllStorage = () =>
     }
   });
 
+// resumeOneJournal dereferences these without a fallback, so a journal missing
+// any of them can't be resumed safely.
+const isResumableJournal = (journal) => {
+  if (!journal.mediaId || !journal.projectId || !journal.videoId) return false;
+  const track = journal.trackType || journal.type;
+  return track === "screen" || track === "camera" || track === "audio";
+};
+
 const pickResumeCandidates = (storage) => {
   const pending = [];
   const abandonedKeys = [];
   for (const [key, value] of Object.entries(storage)) {
     if (!key.startsWith(JOURNAL_KEY_PREFIX)) continue;
     if (!value || typeof value !== "object") continue;
-    if (value.trackType === "audio") continue; // audio is diagnostic, never uploaded
+    // Audio resumes too: it's the transcription source, and the track most
+    // often left stranded.
+    if (!isResumableJournal(value)) continue;
     if (value.status === "completed") continue;
     // status is source of truth; offset>=totalBytes still needs finalize()
     if ((value.resumeAttempts || 0) >= MAX_RESUME_ATTEMPTS) {
@@ -41,9 +64,18 @@ export const tryResumePendingUploads = async ({
       "pendingRecording",
       "resumeInProgress",
       "resumeLockAt",
+      "recorderPipelineState",
     ]);
     if (snap.recording || snap.pendingRecording) {
       return { skipped: "recording-active" };
+    }
+    const pipeline = snap.recorderPipelineState;
+    if (
+      pipeline &&
+      ACTIVE_PIPELINE_STEPS.has(pipeline.step) &&
+      Date.now() - (pipeline.ts || 0) < PIPELINE_ACTIVE_TTL_MS
+    ) {
+      return { skipped: `pipeline-active-${pipeline.step}` };
     }
     if (snap.resumeInProgress) {
       const lockAge = Date.now() - (snap.resumeLockAt || 0);

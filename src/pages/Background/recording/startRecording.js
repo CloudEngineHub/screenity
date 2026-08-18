@@ -11,6 +11,13 @@ import { emitRecordingTelemetry } from "./emitRecordingTelemetry";
 // so countdown-finished + 8s fallback can both fire and open two recorder tabs
 let _startRecordingInFlight = false;
 const STARTRECORDING_GUARD_TIMEOUT_MS = 30000;
+// Start-fail re-check keeps polling while the recorder reports stage progress,
+// so a slow-but-live start isn't torn down. The caps bound a wedged start.
+const RECHECK_INTERVAL_MS = 2500;
+// Generous: the encoder probe stage can legitimately run several seconds on a
+// flaky encoder, and killing a live start is the worse bug.
+const PROGRESS_STALE_MS = 10000;
+const START_PROGRESS_CAP_MS = 25000;
 let _startRecordingGuardTimer = null;
 const releaseStartRecordingGuard = () => {
   _startRecordingInFlight = false;
@@ -247,6 +254,9 @@ const _startRecordingInner = async (caller) => {
     // editor into reading the new in-flight recording
     lastRecordingFinalizedFileName: null,
     lastRecordingError: null,
+    // Stale counters make a genuine start failure read as "recorder was alive"
+    // in the stuck report.
+    recorderLiveProgress: null,
     lastChunkSendFailure: null,
     lastRecordingSalvaged: null,
     lastStartRecordingCaller: { caller, stack, ts: Date.now() },
@@ -315,11 +325,21 @@ const _startRecordingInner = async (caller) => {
 
   chrome.storage.local.set({ lastRecordingType: recordingType || "screen" });
 
-  const { quality, systemAudio, audioInput, offscreen, alarm, alarmTime, countdown } =
+  const {
+    quality,
+    systemAudio,
+    micActive,
+    defaultAudioInput,
+    offscreen,
+    alarm,
+    alarmTime,
+    countdown,
+  } =
     await chrome.storage.local.get([
       "quality",
       "systemAudio",
-      "audioInput",
+      "micActive",
+      "defaultAudioInput",
       "offscreen",
       "alarm",
       "alarmTime",
@@ -338,7 +358,8 @@ const _startRecordingInner = async (caller) => {
     quality: quality || null,
     region: Boolean(customRegion),
     systemAudio: Boolean(systemAudio),
-    audioInput: Boolean(audioInput),
+    // Was "audioInput", a key nothing ever wrote, so this always logged false.
+    audioInput: Boolean(micActive) && defaultAudioInput !== "none",
     offscreen: Boolean(offscreen),
     alarm: Boolean(alarm),
     alarmTime: alarm ? (alarmTime || null) : null,
@@ -414,6 +435,8 @@ const _startRecordingInner = async (caller) => {
     ? { type: "start-recording-tab", region: true }
     : { type: "start-recording-tab" };
 
+  const startDispatchedAt = Date.now();
+
   sendMessageRecord(startMsg).catch((err) => {
     const errStr = String(err).slice(0, 120);
     const isStaleTab =
@@ -421,16 +444,49 @@ const _startRecordingInner = async (caller) => {
       errStr.includes("No tab with id") ||
       errStr.includes("No recording tab available");
     // sendMessage can reject "message port closed" even on a healthy start; re-check
-    setTimeout(async () => {
+    const recheck = async () => {
       let isReallyRecording = false;
+      let trackEnd = null;
+      let progress = null;
       try {
         const snap = await chrome.storage.local.get([
           "recording",
           "pendingRecording",
+          "lastTrackEndEvent",
+          "recorderStartProgress",
         ]);
         isReallyRecording = Boolean(snap.recording);
+        trackEnd = snap.lastTrackEndEvent || null;
+        progress = snap.recorderStartProgress || null;
       } catch {}
       if (isReallyRecording) return;
+      // Still moving mid-start: a slow encoder probe outlasts one window, and
+      // discarding the offscreen doc here is what killed the recording.
+      const isThisStart = progress?.ts && progress.ts >= startDispatchedAt;
+      const isFresh = isThisStart && Date.now() - progress.ts < PROGRESS_STALE_MS;
+      const withinCap = Date.now() - startDispatchedAt < START_PROGRESS_CAP_MS;
+      if (isFresh && withinCap) {
+        setTimeout(recheck, RECHECK_INTERVAL_MS);
+        return;
+      }
+      if (isThisStart) {
+        diagEvent("warning", {
+          note: "start-fail after progress stalled",
+          stage: String(progress.stage || "").slice(0, 40),
+          stalledMs: Date.now() - progress.ts,
+        });
+      }
+      // Stream came up then died (native Stop sharing, source window gone).
+      // That handler already stopped it, so don't overwrite the real reason.
+      if (trackEnd?.ts && trackEnd.ts >= startDispatchedAt) {
+        diagEvent("warning", {
+          note: "start-fail suppressed, stream ended after start",
+          reason: String(trackEnd.reason || "").slice(0, 60),
+          afterMs: trackEnd.ts - startDispatchedAt,
+        });
+        releaseStartRecordingGuard();
+        return;
+      }
       diagEvent("start-fail", {
         region: Boolean(customRegion),
         error: errStr,
@@ -460,7 +516,8 @@ const _startRecordingInner = async (caller) => {
       // sweep it so it can't keep capturing unattended
       sweepRecorderTabs().catch(() => {});
       chrome.action.setIcon({ path: "assets/icon-34.png" });
-    }, 2500);
+    };
+    setTimeout(recheck, RECHECK_INTERVAL_MS);
   });
   chrome.action.setIcon({ path: "assets/recording-logo.png" });
   // chrome.alarms 30s minimum in prod; sub-30s silently bumps or never fires

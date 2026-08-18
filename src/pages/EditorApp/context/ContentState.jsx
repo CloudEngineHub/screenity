@@ -3152,8 +3152,13 @@ const ContentState = (props) => {
       const outputBlob = new Blob([file], {
         type: kind === "webm" ? "video/webm" : "video/mp4",
       });
-      devLog("offscreen-remux-ok", { outputBytes: outputBlob.size });
-      return outputBlob;
+      devLog("offscreen-remux-ok", {
+        outputBytes: outputBlob.size,
+        audioCarried: response.audioCarried,
+      });
+      // audioCarried is undefined on the paths that don't measure it, so only
+      // an explicit false counts as a drop.
+      return { blob: outputBlob, audioCarried: response.audioCarried };
     } finally {
       chrome.runtime.onMessage.removeListener(progressListener);
       // never delete the recording itself
@@ -3242,10 +3247,11 @@ const ContentState = (props) => {
     let remuxPath = null;
     try {
       diagForward("remux-offscreen-start", { inputBytes: inputSize });
-      remuxedBlob = await runRemuxWithStallGuard(
+      const offscreen = await runRemuxWithStallGuard(
         (pg) => remuxViaOffscreenOpfs(blob, pg),
         sharedFinalizeProgress,
       );
+      remuxedBlob = offscreen?.blob || null;
       remuxPath = "offscreen-opfs";
       diagForward("remux-offscreen-ok", { inputBytes: inputSize });
     } catch (err) {
@@ -3305,15 +3311,20 @@ const ContentState = (props) => {
       );
       diagForward("editor-transcode-ok", {
         inputBytes,
-        outputBytes: out?.size || 0,
+        outputBytes: out?.blob?.size || 0,
+        audioCarried: out?.audioCarried,
       });
-      return { blob: out, path: "webm-transcode" };
+      return {
+        blob: out?.blob || null,
+        path: "webm-transcode",
+        audioCarried: out?.audioCarried,
+      };
     } catch (err) {
       diagForward("editor-transcode-fail", {
         inputBytes,
         reason: String(err?.message || err).slice(0, 120),
       });
-      return { blob: null, path: null };
+      return { blob: null, path: null, audioCarried: null };
     }
   };
 
@@ -3321,7 +3332,8 @@ const ContentState = (props) => {
   // an edit (which produces a new blob) re-finalizes.
   const ensureStandardMp4 = () => {
     const blob = contentStateRef.current?.blob;
-    if (!blob) return Promise.resolve({ blob: null, path: null });
+    if (!blob)
+      return Promise.resolve({ blob: null, path: null, audioCarried: null });
     if (blob.type !== "video/mp4") {
       const cur = standardMp4Ref.current;
       if (cur && cur.forBlob === blob && cur.status !== "failed") {
@@ -3334,6 +3346,7 @@ const ContentState = (props) => {
           forBlob: blob,
           blob: res.blob,
           path: res.path,
+          audioCarried: res.audioCarried,
         };
         return res;
       });
@@ -3429,6 +3442,7 @@ const ContentState = (props) => {
     const remuxStartedAt = Date.now();
     let remuxedBlob = null;
     let remuxPath = null;
+    let audioDropped = false;
 
     // Reuse the background pre-warm if it finished (instant) or is in flight
     // (await it); otherwise this runs the finalize now. Keyed on the blob, so
@@ -3437,6 +3451,12 @@ const ContentState = (props) => {
       const res = await ensureStandardMp4();
       remuxedBlob = res.blob;
       remuxPath = res.path;
+      // Transcode lost the audio, so the MP4 would be silent. Fall back to
+      // the source, which still has sound.
+      if (res?.audioCarried === false) {
+        audioDropped = true;
+        remuxedBlob = null;
+      }
     } catch (err) {
       console.warn("[Screenity] standard mp4 finalize failed", err);
     }
@@ -3464,7 +3484,22 @@ const ContentState = (props) => {
 
     if (downloadCancelledRef.current) return;
     try {
-      if (remuxedBlob) {
+      if (audioDropped) {
+        // Source keeps its real extension. WebM bytes named .mp4 won't open in
+        // QuickTime.
+        const fallbackBlob = contentState.blob;
+        const fallbackExt = String(fallbackBlob?.type || "").includes("webm")
+          ? ".webm"
+          : ".mp4";
+        const url = URL.createObjectURL(fallbackBlob);
+        await requestDownload(url, fallbackExt);
+        URL.revokeObjectURL(url);
+        setContentState((prev) => ({ ...prev, saved: true }));
+        diagForward("editor-audio-dropped-fallback", {
+          inputBytes: inputSize,
+          ext: fallbackExt,
+        });
+      } else if (remuxedBlob) {
         const url = URL.createObjectURL(remuxedBlob);
         await requestDownload(url, ".mp4");
         URL.revokeObjectURL(url);
@@ -3602,7 +3637,7 @@ const ContentState = (props) => {
     if (ENABLE_OFFSCREEN_WEBM) {
       let webmBlob = null;
       try {
-        webmBlob = await runRemuxWithStallGuard(
+        const out = await runRemuxWithStallGuard(
           (pg) => remuxViaOffscreenOpfs(sourceBlob, pg, "webm"),
           (p) =>
             setContentState((prev) => ({
@@ -3610,6 +3645,7 @@ const ContentState = (props) => {
               processingProgress: Math.round(p * 100),
             })),
         );
+        webmBlob = out?.blob || null;
       } catch (err) {
         console.warn(
           "[Screenity] offscreen webm convert failed, falling back",

@@ -48,6 +48,7 @@ import { chooseWriter } from "./recorderStorage/chooseWriter";
 import { chooseReader } from "./recorderStorage/chooseReader";
 import { lifecycle } from "../utils/lifecycleLog";
 import { perfMark, perfSpan } from "../utils/perfMarks";
+import { markStartProgress } from "../utils/startProgress";
 import {
   debugRecordingEvent,
   resetRecordingDebugSession,
@@ -1332,6 +1333,7 @@ const Recorder = () => {
     }
 
     perfMark("Recorder.preflight.enter");
+    markStartProgress("preflight-enter");
     const endChunksClear = perfSpan("Recorder.preflight chunksStore.clear");
     if (prewarmChunksClearRef.current) {
       await prewarmChunksClearRef.current;
@@ -1404,11 +1406,13 @@ const Recorder = () => {
     // guess could disagree with the probe and leave bytes the editor
     // can't read. Parallel probe + storage reads drop preflight from
     // ~340ms to <50ms on cache hit.
+    markStartProgress("encoder-probe");
     const [userSettingRaw, stickyState, probeResult] = await Promise.all([
       chrome.storage.local.get(["useWebCodecsRecorder"]),
       getFastRecorderStickyState(),
       probeFastRecorderSupport(),
     ]);
+    markStartProgress("encoder-probe-done");
     const userSetting = resolveFastRecorderUserSetting(
       userSettingRaw.useWebCodecsRecorder,
     );
@@ -1505,6 +1509,7 @@ const Recorder = () => {
       } catch {}
       endBackendRefSet();
       perfMark("Recorder.preflight.done");
+      markStartProgress("preflight-done");
       if (process.env.SCREENITY_DEV_MODE === "true") {
         console.log("[recorder-opfs][recorder] writer-open", {
           backend: selection.backend,
@@ -2343,6 +2348,7 @@ const Recorder = () => {
             },
           });
         } catch {}
+        markStartProgress("webcodecs-start");
         const ok = await recorder.current.start();
 
         debug("WebCodecsRecorder.start() result", ok);
@@ -2519,6 +2525,7 @@ const Recorder = () => {
               })(),
             });
           };
+          markStartProgress("mediarecorder-start");
           recorder.current.start(5000);
           debug("MediaRecorder.start(5000) called");
 
@@ -2722,6 +2729,7 @@ const Recorder = () => {
           const isLikelyContinuityMic = /\biphone\b/i.test(trackLabel);
           const diagnosticInfo = {
             reason: "audio-track-ended",
+            ts: Date.now(),
             savedChunks: savedCount.current,
             lastTimecode: lastTimecode.current,
             recordingDuration,
@@ -2810,6 +2818,8 @@ const Recorder = () => {
         const track = liveStream.current?.getVideoTracks?.()[0] || null;
         const diagnosticInfo = {
           reason: "liveStream-video-track-ended",
+          // BG start-fail re-check compares this against its dispatch time
+          ts: Date.now(),
           savedChunks: savedCount.current,
           lastTimecode: lastTimecode.current,
           recordingDuration: recordingStartTime.current
@@ -2844,6 +2854,7 @@ const Recorder = () => {
         // Log detailed diagnostics for debugging
         const diagnosticInfo = {
           reason: "helperVideoStream-video-track-ended",
+          ts: Date.now(),
           savedChunks: savedCount.current,
           lastTimecode: lastTimecode.current,
           recordingDuration: recordingStartTime.current

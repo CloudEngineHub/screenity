@@ -551,6 +551,22 @@
     "message": "Попробуйте снова",
     "description": "Кнопка повторной попытки при офлайне"
   },
+  "serverIssueTitle": {
+    "message": "Screenity недоступен",
+    "description": "Title shown when the Screenity API is returning server errors"
+  },
+  "serverIssueDescription": {
+    "message": "Запись в облако сейчас недоступна. Попробуйте снова через несколько секунд.",
+    "description": "Description shown when the Screenity API is returning server errors"
+  },
+  "serverUnreachableTitle": {
+    "message": "Не удаётся связаться со Screenity",
+    "description": "Title shown when the Screenity API cannot be reached"
+  },
+  "serverUnreachableDescription": {
+    "message": "Проверьте подключение или повторите попытку через несколько секунд.",
+    "description": "Description shown when the Screenity API cannot be reached"
+  },
   "updateChromeLabelTitle": {
     "message": "Требуется обновление Chrome",
     "description": "Метка обновления Chrome"

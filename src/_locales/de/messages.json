@@ -551,6 +551,22 @@
     "message": "Erneut versuchen",
     "description": "Schaltfläche 'Erneut versuchen' des Offline-Schriftzugs"
   },
+  "serverIssueTitle": {
+    "message": "Screenity ist nicht verfügbar",
+    "description": "Title shown when the Screenity API is returning server errors"
+  },
+  "serverIssueDescription": {
+    "message": "Cloud-Aufnahmen sind gerade nicht verfügbar. Versuche es in Kürze erneut.",
+    "description": "Description shown when the Screenity API is returning server errors"
+  },
+  "serverUnreachableTitle": {
+    "message": "Screenity ist nicht erreichbar",
+    "description": "Title shown when the Screenity API cannot be reached"
+  },
+  "serverUnreachableDescription": {
+    "message": "Prüfe deine Verbindung oder versuche es gleich noch einmal.",
+    "description": "Description shown when the Screenity API cannot be reached"
+  },
   "updateChromeLabelTitle": {
     "message": "Chrome muss aktualisiert werden",
     "description": "Aktualisieren Sie den Chrome-Schriftzug"

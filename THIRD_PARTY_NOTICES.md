@@ -36,9 +36,10 @@ _SPDX `Apache-2.0`, 2 packages_
 - **localforage** @ 1.10.0, Copyright (c) 2013-2017 Mozilla
 
 ### Mozilla Public License 2.0  
-_SPDX `MPL-2.0`, 1 package_
+_SPDX `MPL-2.0`, 2 packages_
 
-- **mediabunny** @ 1.46.0, Copyright (c) Vanilagy and contributors
+- **mediabunny** @ 1.53.0, Copyright (c) Vanilagy and contributors
+- **@mediabunny/aac-encoder** @ 1.53.1, Copyright (c) Vanilagy and contributors
 
 ### MIT License  
 _SPDX `MIT`, 144 packages_
@@ -429,7 +430,7 @@ Apache License
 
 ## Mozilla Public License 2.0
 
-Applies to **mediabunny**, bundled unmodified from npm (`mediabunny@1.46.0`). Source is available upstream.
+Applies to **mediabunny** and **@mediabunny/aac-encoder**, bundled unmodified from npm (`mediabunny@1.53.0`, `@mediabunny/aac-encoder@1.53.1`). Source is available upstream.
 
 ```
 Mozilla Public License Version 2.0

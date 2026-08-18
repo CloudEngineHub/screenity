@@ -279,6 +279,7 @@ export const getStorageFlags = async () => {
     "isLoggedIn",
     "isSubscribed",
     "proSubscription",
+    "apiReachability",
   ];
   try {
     return await chrome.storage.local.get(keys);

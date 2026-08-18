@@ -1,5 +1,7 @@
 import localforage from "localforage";
 import BunnyTusUploader from "../CloudRecorder/bunnyTusUploader";
+import { getClientSessionId } from "../CloudRecorder/clientSessionId";
+import { TRACK_KEY_PREFIX } from "../CloudRecorder/recorderStorage/chooseChunksStore";
 import { openExistingChunksStore } from "../CloudRecorder/recorderStorage/chooseChunksStore";
 
 localforage.config({
@@ -10,8 +12,10 @@ localforage.config({
 
 const JOURNAL_KEY_PREFIX = "uploadJournal-";
 
+// Audio must map to its own store. Flattening it to "screen" would resume a
+// mic journal out of the screen chunks and upload the wrong track's bytes.
 const trackName = (trackType) =>
-  trackType === "camera" ? "camera" : "screen";
+  trackType === "camera" || trackType === "audio" ? trackType : "screen";
 
 // Pulls per-journal storage backend from the persisted recorder session.
 // Journals written before the OPFS migration default to IDB. The uploader
@@ -56,7 +60,7 @@ const resolveBackendForJournal = async (journal) => {
 };
 
 const chunkKeyPrefixForTrack = (trackType) =>
-  trackType === "camera" ? "camera_chunk_" : "chunk_";
+  TRACK_KEY_PREFIX[trackType] || "chunk_";
 
 const loadChunksSorted = async (store, prefix = "chunk_") => {
   const items = [];
@@ -170,7 +174,10 @@ export const resumeOneJournal = async (journal) => {
     return { ok: false, error: "chunks-missing" };
   }
 
-  const uploader = new BunnyTusUploader({ trackType });
+  const uploader = new BunnyTusUploader({
+    trackType,
+    clientSessionId: getClientSessionId(),
+  });
 
   try {
     await uploader.initialize(projectId, {

@@ -551,6 +551,22 @@
     "message": "Riprova",
     "description": "Pulsante per riprovare dell'etichetta offline"
   },
+  "serverIssueTitle": {
+    "message": "Screenity non è disponibile",
+    "description": "Title shown when the Screenity API is returning server errors"
+  },
+  "serverIssueDescription": {
+    "message": "La registrazione nel cloud non è disponibile al momento. Riprova tra poco.",
+    "description": "Description shown when the Screenity API is returning server errors"
+  },
+  "serverUnreachableTitle": {
+    "message": "Impossibile raggiungere Screenity",
+    "description": "Title shown when the Screenity API cannot be reached"
+  },
+  "serverUnreachableDescription": {
+    "message": "Controlla la connessione o riprova tra poco.",
+    "description": "Description shown when the Screenity API cannot be reached"
+  },
   "updateChromeLabelTitle": {
     "message": "Chrome deve essere aggiornato",
     "description": "Etichetta per aggiornare Chrome"

@@ -7,12 +7,29 @@ import { fixWebmDurationOffThread } from "../Editor/utils/fixWebmDurationOffThre
 const lazyUtil = (importFn) =>
   (...args) =>
     importFn().then((m) => m.default(...args));
-const addAudioToVideo = lazyUtil(() => import("../Editor/utils/addAudioToVideo"));
-const convertWebmToMp4 = lazyUtil(() => import("../Editor/utils/convertWebmToMp4"));
-const cropVideo = lazyUtil(() => import("../Editor/utils/cropVideo"));
-const cutVideo = lazyUtil(() => import("../Editor/utils/cutVideo"));
-const muteVideo = lazyUtil(() => import("../Editor/utils/muteVideo"));
-const reencodeVideo = lazyUtil(() => import("../Editor/utils/reencodeVideo"));
+// These ops write MP4 audio, which must be AAC. Linux browsers have none, so
+// the wasm encoder is registered here, best-effort.
+const lazyMp4Util = (importFn) =>
+  async (...args) => {
+    try {
+      const { ensureAacEncoder } = await import("../utils/aacPolyfill");
+      await ensureAacEncoder();
+    } catch {}
+    const m = await importFn();
+    return m.default(...args);
+  };
+const addAudioToVideo = lazyMp4Util(() =>
+  import("../Editor/utils/addAudioToVideo"),
+);
+const convertWebmToMp4 = lazyMp4Util(() =>
+  import("../Editor/utils/convertWebmToMp4"),
+);
+const cropVideo = lazyMp4Util(() => import("../Editor/utils/cropVideo"));
+const cutVideo = lazyMp4Util(() => import("../Editor/utils/cutVideo"));
+const muteVideo = lazyMp4Util(() => import("../Editor/utils/muteVideo"));
+const reencodeVideo = lazyMp4Util(() =>
+  import("../Editor/utils/reencodeVideo"),
+);
 const toGIF = lazyUtil(() => import("../Editor/utils/toGIF"));
 const getFrame = lazyUtil(() => import("../Editor/utils/getFrame"));
 const convertMp4ToWebm = lazyUtil(() => import("../Editor/utils/convertMp4ToWebm"));

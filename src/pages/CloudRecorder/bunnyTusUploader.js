@@ -94,6 +94,9 @@ export default class BunnyTusUploader {
   constructor(options = {}) {
     this.CHUNK_SIZE = options.chunkSize || 512 * 1024;
     this.MAX_RETRIES = options.maxRetries || 5;
+    // Short writes make real progress, so they get their own budget instead of
+    // the retry one. One pass per KB of a default chunk, a backstop not a limit.
+    this.MAX_SHORT_WRITE_PASSES = options.maxShortWritePasses || 512;
     this.RETRY_DELAY = options.retryDelay || 1000;
     this.UPLOAD_TIMEOUT_MS = options.uploadTimeoutMs || 20000;
     this.HEARTBEAT_INTERVAL_MS = options.heartbeatIntervalMs || 10000;
@@ -105,6 +108,9 @@ export default class BunnyTusUploader {
     this.onTelemetry = options.onTelemetry || null;
     this.onStateChange = options.onStateChange || null;
     this.trackType = options.trackType || null;
+    // Passed by callers, not derived here: one id per host (page load), so a
+    // second uploader attaching to the same video is visible in telemetry.
+    this.clientSessionId = options.clientSessionId || null;
     // Container declared in TUS Upload-Metadata. Defaults to webm for
     // back-compat with pre-WebCodecs callers; cloud's WebCodecs path
     // overrides to "video/mp4" for screen + camera tracks. Audio always
@@ -162,6 +168,13 @@ export default class BunnyTusUploader {
     this.finalizedAt = null;
     this.resumeCount = 0;
     this.lastServerOffset = 0;
+    // Consecutive PATCHes that returned 2xx while the server offset stood still.
+    this.noServerProgressCount = 0;
+    this._warnedMissingOffsetHeader = false;
+    // Consecutive HEADs showing the server behind the client and not catching up.
+    this._offsetDivergenceCount = 0;
+    this._lastDivergence = 0;
+    this._reconcileTickCount = 0;
     this.hasEmittedClientStarted = false;
     this.hasEmittedFirstByte = false;
     this.lastProgressEventAt = 0;
@@ -204,6 +217,7 @@ export default class BunnyTusUploader {
         codec: this.codec || null,
         container: this.container || null,
         encoderKind: this.encoderKind || null,
+        clientSessionId: this.clientSessionId || null,
         ...payload,
       };
       this.onTelemetry(event, body);
@@ -624,10 +638,94 @@ export default class BunnyTusUploader {
     return null;
   }
 
+  // Rewinds local accounting to server truth, else write() trips the
+  // server-offset-regressed guard on the first re-sent PATCH.
+  prepareGapResend(serverOffset) {
+    if (!Number.isFinite(serverOffset) || serverOffset < 0) return false;
+    if (this.isFinalizing) return false;
+    this.chunkQueue = [];
+    this.queuedBytes = 0;
+    this.offset = serverOffset;
+    this.lastServerOffset = serverOffset;
+    // write() adds the re-sent bytes back on top.
+    this.totalBytes = serverOffset;
+    this.noServerProgressCount = 0;
+    this._offsetDivergenceCount = 0;
+    this._lastDivergence = 0;
+    this.error = null;
+    this.lastErrorCode = null;
+    this.stalled = false;
+    this.isPaused = false;
+    this.status = "uploading";
+    this.emitTelemetry("upload_gap_resend_prepared", { serverOffset });
+    return true;
+  }
+
+  // A HEAD is the only authority on what Bunny holds: a PATCH can 2xx without
+  // applying, and a missing Upload-Offset leaves the client on local math.
+  async reconcileServerOffset(reason) {
+    if (!this.uploadUrl || this.isFinalizing || this.isPaused) return;
+    if (
+      this.status === "completed" ||
+      this.status === "aborted" ||
+      this.status === "error"
+    ) {
+      return;
+    }
+    // Mid-PATCH the server legitimately trails. Reading now invents divergence.
+    if (this.currentPatchAbort) return;
+    const serverOffset = await this.getServerOffset();
+    // Unreadable is not evidence of divergence.
+    if (serverOffset === null) return;
+
+    if (serverOffset >= this.offset) {
+      this._offsetDivergenceCount = 0;
+      this._lastDivergence = 0;
+      // Server-derived, so purge can trust it even when PATCH responses can't.
+      this.lastServerOffset = serverOffset;
+      return;
+    }
+
+    const divergence = this.offset - serverOffset;
+    // One in-flight chunk plus a chunk of eventual-consistency lag.
+    if (divergence <= this.CHUNK_SIZE * 2) {
+      this._lastDivergence = divergence;
+      return;
+    }
+    const catchingUp =
+      this._lastDivergence > 0 && divergence < this._lastDivergence;
+    this._lastDivergence = divergence;
+    if (catchingUp) {
+      this._offsetDivergenceCount = 0;
+      return;
+    }
+
+    this._offsetDivergenceCount += 1;
+    this.emitTelemetry("upload_server_offset_behind", {
+      reason: `offset-behind-${divergence}-conf-${this._offsetDivergenceCount}-${
+        reason || "unknown"
+      }`,
+      clientOffset: this.offset,
+      serverOffset,
+      divergence,
+      confirmations: this._offsetDivergenceCount,
+    });
+    if (this._offsetDivergenceCount >= 2) {
+      // Deliberately not rewriting this.offset down: PATCHing from the server's
+      // offset would skip the missing bytes and mux a hole into the file.
+      this.setUploaderError("server-offset-behind-client", {
+        clientOffset: this.offset,
+        serverOffset,
+        divergence,
+      });
+    }
+  }
+
   async getServerOffset() {
     if (!this.uploadUrl) return null;
     try {
       const headRes = await fetch(this.uploadUrl, {
+        redirect: "error",
         method: "HEAD",
         headers: {
           "Tus-Resumable": "1.0.0",
@@ -1157,6 +1255,17 @@ export default class BunnyTusUploader {
     const now = Math.floor(Date.now() / 1000);
     if (this.expires - now < this.TOKEN_REFRESH_THRESHOLD) {
       await this.refreshTusAuth();
+      // Re-signing mid-upload is off-contract for Bunny, and the camera that
+      // went silent had re-signed first. 6h TTL, so firing at all is the signal.
+      this.emitTelemetry("upload_auth_refreshed_midupload", {
+        reason: "auth-refresh-expiry",
+        trigger: "expiry",
+        offset: this.offset,
+        expires: this.expires || null,
+      });
+      setTimeout(() => {
+        this.reconcileServerOffset("post-auth-refresh").catch(() => {});
+      }, 3000);
 
       if (this.isProcessingQueue) {
         this.pause();
@@ -1165,22 +1274,32 @@ export default class BunnyTusUploader {
     }
   }
   async uploadChunk(chunk) {
+    // Bytes the server already took, so processQueue re-queues only the tail.
+    // Cleared first: arrayBuffer() can reject and a stale count slices wrong.
+    this._chunkConsumedBytes = 0;
     // processQueue already shifted this chunk off the queue, so bailing here
     // drops it for good. Finalize's drain is exactly when the queue still
     // holds bytes we are about to declare.
     if (this.isFinalizing && !this.isDrainingForFinalize) return;
-    let data = new Uint8Array(await chunk.arrayBuffer());
+    // Kept whole so a resync can re-slice from the chunk's true start. Trimming
+    // the trimmed view is what dropped bytes a short write had already skipped.
+    const fullData = new Uint8Array(await chunk.arrayBuffer());
+    let data = fullData;
     const chunkStartOffset = this.offset;
     // One-shot 401 refresh per chunk. Re-armed each chunk so a token
     // expiring across many chunks keeps recovering.
     let didAuth401Refresh = false;
+    let shortWritePasses = 0;
+    let exhaustedReason = "chunk-upload-loop-exhausted";
 
+    try {
     for (let attempt = 0; attempt <= this.MAX_RETRIES; attempt++) {
       // Hoisted so the catch can read signal.reason (wake-jump/stall-recovery/
       // upload-timeout) for telemetry; in-try it would be out of scope.
       let controller = null;
       try {
-        // AuthorizationSignature has ~20min TTL; refresh before every PATCH.
+        // Signature TTL is 6h (generateBunnyUploadSignature), so this no-ops
+        // until 5h55m in. Session lifetime binds to the creation expiry.
         await this.checkAuthExpiration();
 
         const currentOffset = this.offset;
@@ -1194,6 +1313,9 @@ export default class BunnyTusUploader {
         );
 
         const res = await fetch(this.uploadUrl, {
+          // Followed silently by default: a proxy or captive-portal 3xx sends
+          // the chunk and signature onward, and its 200 reads as a good write.
+          redirect: "error",
           method: "PATCH",
           headers: {
             "Tus-Resumable": "1.0.0",
@@ -1212,34 +1334,102 @@ export default class BunnyTusUploader {
 
         if (res.ok || res.status === 204) {
           const serverOffsetHeader = res.headers.get("Upload-Offset");
-          let nextOffset;
+          // Exactly this, not "at least this". A 2xx that advanced the server
+          // by less means the rest of the chunk never landed.
+          const expectedOffset = currentOffset + data.length;
           if (serverOffsetHeader) {
             const parsed = parseInt(serverOffsetHeader, 10);
-            // Validate the parsed offset. parseInt("0x100", 10) returns 0,
-            // which would silently reset the upload. Require a finite value
-            // at least equal to what was sent.
-            const expectedMin = currentOffset + data.length;
+            // parseInt("0x100", 10) returns 0, which would silently reset the
+            // upload. A regression or an overshoot is server state we can't use.
             if (
               !Number.isFinite(parsed) ||
               parsed < currentOffset ||
-              parsed > expectedMin
+              parsed > expectedOffset
             ) {
               this.setUploaderError("invalid-server-offset", {
                 serverOffsetHeader,
                 parsed,
                 currentOffset,
-                expectedMin,
+                expectedOffset,
               });
               throw new Error(
                 `Invalid Upload-Offset from server: "${serverOffsetHeader}"`,
               );
             }
-            nextOffset = parsed;
+            if (parsed < expectedOffset) {
+              // Short write. Counting it as a full one is what let a camera
+              // track discard 10k chunks while pinned at offset 28.
+              const acceptedBytes = parsed - currentOffset;
+              this.offset = parsed;
+              this.lastServerOffset = parsed;
+              this.noServerProgressCount =
+                acceptedBytes > 0 ? 0 : this.noServerProgressCount + 1;
+              this.emitTelemetry("upload_chunk_short_write", {
+                reason: `short-write-accepted-${acceptedBytes}-streak-${
+                  this.noServerProgressCount
+                }${res.url === this.uploadUrl ? "" : "-foreign-responder"}`,
+                currentOffset,
+                expectedOffset,
+                parsed,
+                acceptedBytes,
+                noProgressStreak: this.noServerProgressCount,
+                // Who answered. resUrl !== uploadUrl means something between us
+                // and Bunny replied, which is the open question on this bug.
+                httpStatus: res.status,
+                resType: res.type || null,
+                resUrlMatches: res.url === this.uploadUrl,
+              });
+              if (this.noServerProgressCount >= 3) {
+                this.setUploaderError("server-offset-not-advancing", {
+                  parsed,
+                  currentOffset,
+                });
+                throw new Error(`Server offset stuck at ${parsed}`);
+              }
+              if (acceptedBytes > 0) {
+                data = fullData.subarray(parsed - chunkStartOffset);
+                this.recordProgress(acceptedBytes);
+              }
+              shortWritePasses += 1;
+              // Breaks to the post-loop throw. Throwing here would be caught by
+              // this loop's own catch and retried, which never terminates.
+              if (shortWritePasses > this.MAX_SHORT_WRITE_PASSES) {
+                exhaustedReason = "chunk-short-write-passes-exhausted";
+                break;
+              }
+              if (acceptedBytes > 0) {
+                // Real progress, so don't spend retry budget on it. Without
+                // this the loop falls out mid-chunk and the tail is lost.
+                attempt = -1;
+                continue;
+              }
+              // Took nothing. Delay so a server that keeps taking nothing
+              // can't be hammered. The 3-strike guard above ends it.
+              await new Promise((r) =>
+                setTimeout(r, 500 * Math.max(1, this.noServerProgressCount)),
+              );
+              continue;
+            }
+            this.noServerProgressCount = 0;
+            this.offset = parsed;
+            this.lastServerOffset = parsed;
           } else {
-            nextOffset = currentOffset + data.length;
+            // No readable Upload-Offset via CORS. Advance locally to drain the
+            // queue, but leave lastServerOffset, what purge deletes against.
+            this.offset = expectedOffset;
+            if (!this._warnedMissingOffsetHeader) {
+              this._warnedMissingOffsetHeader = true;
+              this.emitTelemetry("upload_offset_header_missing", {
+                reason: `offset-header-missing${
+                  res.url === this.uploadUrl ? "" : "-foreign-responder"
+                }`,
+                currentOffset,
+                httpStatus: res.status,
+                resType: res.type || null,
+                resUrlMatches: res.url === this.uploadUrl,
+              });
+            }
           }
-          this.offset = nextOffset;
-          this.lastServerOffset = this.offset;
 
           this.recordProgress(data.length);
           return;
@@ -1254,8 +1444,14 @@ export default class BunnyTusUploader {
             console.warn(
               "[bunnyTusUploader] 401 mid-PATCH; refreshing TUS auth + retrying once",
             );
-            this.emitTelemetry("upload_auth_refresh_after_401", {
+            // Same event name as app-web so one query spans both clients.
+            // trigger separates "Bunny rejected us" from "we resumed".
+            this.emitTelemetry("upload_auth_refreshed_midupload", {
+              reason: "auth-refresh-http-401",
+              trigger: "http-401",
               attempt,
+              offset: this.offset,
+              httpStatus: 401,
             });
             try {
               await this.refreshTusAuth();
@@ -1318,6 +1514,20 @@ export default class BunnyTusUploader {
                     `Server offset regressed (${serverOffset} < ${priorOffset})`,
                   );
                 }
+                // Absolute position in this chunk, so any mix of short writes
+                // and resyncs lands on the same byte.
+                const trimmedBytes = serverOffset - chunkStartOffset;
+                if (trimmedBytes < 0) {
+                  // Below chunk start: those bytes are gone from `data`, so adopting would
+                  // PATCH misaligned. A CORS-stripped Upload-Offset parses as 0.
+                  this.emitTelemetry("upload_resync_offset_below_chunk", {
+                    reason: "resync-offset-below-chunk",
+                    serverOffset,
+                    chunkStartOffset,
+                    chunkLength: fullData.length,
+                  });
+                  continue;
+                }
                 this.lastServerOffset = serverOffset;
                 this.offset = serverOffset;
                 this.emitTelemetry("upload_resumed", {
@@ -1326,22 +1536,22 @@ export default class BunnyTusUploader {
                 });
                 this.scheduleJournalPersist({ force: true });
 
-                const chunkEnd = chunkStartOffset + data.length;
-                if (serverOffset >= chunkEnd) {
+                // Ahead of the whole chunk too: a debounced journal can resume
+                // behind the server, and those chunks are already up.
+                if (trimmedBytes >= fullData.length) {
                   this.emitTelemetry("upload_chunk_skipped_after_resync", {
                     chunkStartOffset,
-                    chunkLength: data.length,
+                    chunkLength: fullData.length,
                     serverOffset,
                   });
                   this.recordProgress(0);
                   return;
                 }
-                if (serverOffset > chunkStartOffset) {
-                  const trimmedBytes = serverOffset - chunkStartOffset;
-                  data = data.subarray(trimmedBytes);
+                data = fullData.subarray(trimmedBytes);
+                if (trimmedBytes > 0) {
                   this.emitTelemetry("upload_chunk_trimmed_after_resync", {
                     chunkStartOffset,
-                    chunkLength: data.length + trimmedBytes,
+                    chunkLength: fullData.length,
                     trimmedBytes,
                     serverOffset,
                   });
@@ -1376,7 +1586,8 @@ export default class BunnyTusUploader {
             ? controller.signal.reason
             : null;
         this.currentPatchAbort = null;
-        // Transient errors (network/timeout/stall-abort/5xx/408/429) retry forever with capped backoff.
+        // Transient errors (network/timeout/stall-abort/5xx/408/423/425/429)
+        // retry forever with capped backoff. 423 = Bunny's resource lock.
         const isExplicitAbort =
           this.status === "aborted" || this.isPaused === true;
         if (isExplicitAbort) {
@@ -1387,8 +1598,13 @@ export default class BunnyTusUploader {
         const isTransient =
           err?.name === "AbortError" ||
           err?.name === "TypeError" ||
-          (status !== null && (status >= 500 || status === 408 || status === 429)) ||
-          /Upload failed \((?:5\d\d|408|429)\b/.test(msg) ||
+          (status !== null &&
+            (status >= 500 ||
+              status === 408 ||
+              status === 423 ||
+              status === 425 ||
+              status === 429)) ||
+          /Upload failed \((?:5\d\d|408|423|425|429)\b/.test(msg) ||
           /network|Failed to fetch|timeout/i.test(msg);
         if (err?.name === "AbortError") {
           console.warn(
@@ -1459,6 +1675,18 @@ export default class BunnyTusUploader {
         }
       }
     }
+    // Falling out means the chunk never fully landed. Returning here reads as
+    // success to processQueue, which then shifts the next chunk over the gap.
+    this.setUploaderError(exhaustedReason, {
+      chunkStartOffset,
+      remaining: data.length,
+      shortWritePasses,
+    });
+    throw new Error(`Chunk upload did not complete (${exhaustedReason})`);
+    } catch (err) {
+      this._chunkConsumedBytes = Math.max(0, this.offset - chunkStartOffset);
+      throw err;
+    }
   }
 
   async processQueue() {
@@ -1483,8 +1711,20 @@ export default class BunnyTusUploader {
         } catch (err) {
           console.error("❌ Chunk upload failed in queue:", err);
 
-          this.chunkQueue.unshift(chunk);
-          this.queuedBytes += chunk.size;
+          // The server may have taken a prefix before failing. Re-queueing the
+          // whole chunk would re-send it at the advanced offset and overshoot.
+          const consumed = Math.min(this._chunkConsumedBytes || 0, chunk.size);
+          const retryChunk = consumed > 0 ? chunk.slice(consumed) : chunk;
+          if (consumed > 0) {
+            this.emitTelemetry("upload_chunk_requeued_tail", {
+              reason: "requeue-after-partial-accept",
+              consumed,
+              remaining: retryChunk.size,
+            });
+          }
+          this._chunkConsumedBytes = 0;
+          this.chunkQueue.unshift(retryChunk);
+          this.queuedBytes += retryChunk.size;
 
           // Don't clobber a non-recoverable code that uploadChunk already
           // set (e.g. "offset-conflict-head-failed", "invalid-server-offset"),
@@ -1589,6 +1829,7 @@ export default class BunnyTusUploader {
       let serverOffset = null;
       try {
         const headRes = await fetch(this.uploadUrl, {
+          redirect: "error",
           method: "HEAD",
           headers: {
             "Tus-Resumable": "1.0.0",
@@ -1650,19 +1891,34 @@ export default class BunnyTusUploader {
       // Upload-Length must equal Upload-Offset to complete, and can never be
       // below it. Declaring the client tally when the two disagreed was what
       // Bunny rejected.
-      const res = await fetch(this.uploadUrl, {
-        method: "PATCH",
-        headers: {
-          "Tus-Resumable": "1.0.0",
-          "Content-Type": "application/offset+octet-stream",
-          "Upload-Offset": String(serverOffset),
-          "Upload-Length": String(serverOffset),
-          AuthorizationSignature: this.signature,
-          AuthorizationExpire: String(this.expires),
-          LibraryId: String(this.libraryId),
-          VideoId: this.videoId,
-        },
-      });
+      // 423 = another request holds Bunny's lock, clears in about a second.
+      // No outer retry here, so failing costs the whole finalize.
+      let res = null;
+      let lockRetries = 0;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        if (attempt > 0) {
+          lockRetries = attempt;
+          await new Promise((r) => setTimeout(r, 1000 * attempt));
+        }
+        res = await fetch(this.uploadUrl, {
+          redirect: "error",
+          method: "PATCH",
+          headers: {
+            "Tus-Resumable": "1.0.0",
+            "Content-Type": "application/offset+octet-stream",
+            "Upload-Offset": String(serverOffset),
+            "Upload-Length": String(serverOffset),
+            AuthorizationSignature: this.signature,
+            AuthorizationExpire: String(this.expires),
+            LibraryId: String(this.libraryId),
+            VideoId: this.videoId,
+          },
+        });
+        if (res.status !== 423) break;
+        console.warn(
+          `[bunnyTusUploader] finalize got 423 Locked, retry ${attempt + 1}/2`,
+        );
+      }
 
       // 410 = Bunny reports the upload is already finalized. Treat as
       // success; server is the truth, retrying would just loop.
@@ -1676,6 +1932,7 @@ export default class BunnyTusUploader {
       this.emitTelemetry("upload_finalize_completed", {
         finalizedBytes: this.totalBytes,
         alreadyFinalized: alreadyFinalized || undefined,
+        lockRetries: lockRetries || undefined,
         // Reconciled a prior session's unjournaled bytes back in (no loss).
         recoveredBytes: recoveredBytes || undefined,
         // Finalized a truncated clean prefix; this many tail bytes were
@@ -1843,6 +2100,16 @@ export default class BunnyTusUploader {
         this.attemptStallRecovery(diff).catch((err) => {
           console.warn("[bunnyTusUploader] stall recovery failed:", err);
         });
+        return;
+      }
+
+      // Every 3rd tick (~30s). A progressing upload looks identical to one
+      // whose PATCHes 2xx into the void until something reads the server.
+      this._reconcileTickCount += 1;
+      if (this._reconcileTickCount % 3 === 0) {
+        this.reconcileServerOffset("heartbeat").catch((err) => {
+          console.warn("[bunnyTusUploader] offset reconcile failed:", err);
+        });
       }
     }, this.HEARTBEAT_INTERVAL_MS);
   }
@@ -1860,6 +2127,7 @@ export default class BunnyTusUploader {
       // Resync via HEAD so a partially-applied PATCH doesn't dup bytes.
       try {
         const res = await fetch(this.uploadUrl, {
+          redirect: "error",
           method: "HEAD",
           headers: {
             "Tus-Resumable": "1.0.0",
@@ -1943,6 +2211,11 @@ export default class BunnyTusUploader {
       this.emitTelemetry("upload_first_byte", {
         bytes,
       });
+      // Stuck-at-init is the reported signature, so check this one early rather
+      // than waiting 30s. Off the hot path: start latency is measured.
+      setTimeout(() => {
+        this.reconcileServerOffset("first-byte").catch(() => {});
+      }, 3000);
     }
     if (
       this.lastProgressEventAt === 0 ||

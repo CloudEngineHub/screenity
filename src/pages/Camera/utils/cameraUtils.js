@@ -354,8 +354,14 @@ export const surfaceHandler = async (request, videoRef) => {
     return;
   }
 
+  // recordingType leads, surface only qualifies it: displaySurface reports
+  // "monitor" for a region/tab crop too, since the crop happens after the pick.
+  const CROPPED_TYPES = ["region", "tab", "camera"];
+  const croppedCapture = CROPPED_TYPES.includes(request.recordingType);
+  const fullMonitor = request.surface === "monitor" && !croppedCapture;
+
   if (!CLOUD_FEATURES_ENABLED) {
-    const shouldEnterPip = request.surface === "monitor";
+    const shouldEnterPip = fullMonitor;
     if (shouldEnterPip && videoRef.current) {
       try {
         await videoRef.current.requestPictureInPicture();
@@ -383,7 +389,7 @@ export const surfaceHandler = async (request, videoRef) => {
     // the camera's part of the screen recording when it isn't
     // (pro+non-instant+monitor).
     const shouldEnterPip =
-      (request.surface === "monitor" && (!isSubscribed || instantMode)) ||
+      (fullMonitor && (!isSubscribed || instantMode)) ||
       (request.surface !== "monitor" && isSubscribed && !instantMode);
 
     if (shouldEnterPip && videoRef.current) {

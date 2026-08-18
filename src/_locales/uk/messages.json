@@ -551,6 +551,22 @@
     "message": "Спробуйте знову",
     "description": "Offline label try again button"
   },
+  "serverIssueTitle": {
+    "message": "Screenity недоступний",
+    "description": "Title shown when the Screenity API is returning server errors"
+  },
+  "serverIssueDescription": {
+    "message": "Запис у хмару зараз недоступний. Спробуйте ще раз за кілька секунд.",
+    "description": "Description shown when the Screenity API is returning server errors"
+  },
+  "serverUnreachableTitle": {
+    "message": "Не вдається зв'язатися зі Screenity",
+    "description": "Title shown when the Screenity API cannot be reached"
+  },
+  "serverUnreachableDescription": {
+    "message": "Перевірте з'єднання або спробуйте ще раз за кілька секунд.",
+    "description": "Description shown when the Screenity API cannot be reached"
+  },
   "updateChromeLabelTitle": {
     "message": "Необхідне оновлення Chrome",
     "description": "Update Chrome label"

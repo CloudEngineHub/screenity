@@ -122,10 +122,18 @@ export const CameraProvider = ({ children }) => {
     globalRefs.setBackgroundEffects = handleSetBackgroundEffects;
     globalRefs.backgroundEffectsRef = backgroundEffectsRef;
 
+    let unmounted = false;
+
     const initializeModel = async () => {
       try {
         const model = await loadSegmentationModel();
         if (model) {
+          // Unmounted mid-load: close it instead of stashing a segmenter
+          // nothing will ever tear down.
+          if (unmounted) {
+            try { model.close?.(); } catch {}
+            return;
+          }
           segmenterRef.current = model;
           setIsModelLoaded(true);
         } else {
@@ -150,6 +158,10 @@ export const CameraProvider = ({ children }) => {
     });
 
     return () => {
+      unmounted = true;
+      // Nulling the ref alone leaks the wasm graph and its GL context,
+      // so every camera remount stacked another one.
+      try { segmenterRef.current?.close?.(); } catch {}
       segmenterRef.current = null;
       setIsModelLoaded(false);
     };

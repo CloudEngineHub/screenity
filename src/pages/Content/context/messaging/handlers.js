@@ -754,6 +754,7 @@ export const setupHandlers = () => {
         recording: false,
         paused: false,
         pipEnded: false,
+        pipActive: false,
         time: 0,
         timer: 0,
       }));
@@ -792,8 +793,13 @@ export const setupHandlers = () => {
       state.openToast("Upload complete.", () => {}, 4000);
     }
   });
-  registerMessage("recording-error", () => {
-    setStartFlowOutcome("error");
+  registerMessage("recording-error", (message) => {
+    // Sender carries why/errorCode. Dropping them landed every
+    // error-triggered report with a null cause.
+    setStartFlowOutcome("error", {
+      error: message?.why || message?.error || null,
+      errorCode: message?.errorCode || null,
+    });
     setContentState((prev) => ({
       ...prev,
       pendingRecording: false,
@@ -803,6 +809,7 @@ export const setupHandlers = () => {
       time: 0,
       timer: 0,
       pipEnded: false,
+      pipActive: false,
     }));
     const state = getState();
     if (state && typeof state.openModal === "function") {
@@ -911,24 +918,24 @@ export const setupHandlers = () => {
     }));
   });
 
+  // pipActive tracks whether PiP is really on screen and is what hides the
+  // bubble. Both edges land outside a recording too, or a failed PiP hides it.
   registerMessage("pip-ended", () => {
     const state = getState();
-    if (state.recording || state.pendingRecording) {
-      setContentState((prev) => ({
-        ...prev,
-        pipEnded: true,
-      }));
-    }
+    setContentState((prev) => ({
+      ...prev,
+      pipActive: false,
+      ...(state.recording || state.pendingRecording ? { pipEnded: true } : {}),
+    }));
   });
 
   registerMessage("pip-started", () => {
     const state = getState();
-    if (state.recording || state.pendingRecording) {
-      setContentState((prev) => ({
-        ...prev,
-        pipEnded: false,
-      }));
-    }
+    setContentState((prev) => ({
+      ...prev,
+      pipActive: true,
+      ...(state.recording || state.pendingRecording ? { pipEnded: false } : {}),
+    }));
   });
 
   registerMessage("setup-complete", () => {
@@ -1153,6 +1160,7 @@ export const setupHandlers = () => {
         showExtension: true,
         recording: true,
         pipEnded: true,
+        pipActive: false,
       }));
       updateFromStorage(false, sender.id);
     }
@@ -1165,6 +1173,7 @@ export const setupHandlers = () => {
       pendingRecording: false,
       preparingRecording: false,
       pipEnded: false,
+      pipActive: false,
     }));
   });
 
@@ -1198,6 +1207,7 @@ export const setupHandlers = () => {
       timeWarning: false,
       tabCaptureFrame: false,
       pipEnded: false,
+      pipActive: false,
       // Seed multi-mode + scene count + project id from storage. This
       // is the field set that gates the popup's "Done" button (uses
       // multiMode + multiSceneCount > 0); if either is stale, the

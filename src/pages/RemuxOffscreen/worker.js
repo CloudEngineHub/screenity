@@ -17,6 +17,7 @@ import {
 } from "mediabunny";
 import { createOpfsWritable } from "./opfsTarget";
 import { videoConverter } from "../Editor/mediabunny/lib/videoConverter";
+import { ensureAacEncoder, getAacPath } from "../utils/aacPolyfill";
 
 const TEMP_FILE_PREFIX = "remux-";
 const STALE_AGE_MS = 5 * 60 * 1000;
@@ -30,8 +31,16 @@ const postProgress = (requestId, progress) => {
   self.postMessage({ type: "progress", requestId, progress });
 };
 
-const postDone = (requestId, outputFileName) => {
-  self.postMessage({ type: "done", requestId, outputFileName });
+// audioCarried: false means the source had audio the output couldn't hold.
+// null means nothing measured it, which the caller must not read as a drop.
+const postDone = (requestId, outputFileName, audioCarried = null, aacPath = null) => {
+  self.postMessage({
+    type: "done",
+    requestId,
+    outputFileName,
+    audioCarried,
+    aacPath,
+  });
 };
 
 const postError = (requestId, error) => {
@@ -208,7 +217,11 @@ const remuxToOpfs = async ({ requestId, inputFileName, outputFileName }) => {
     if (videoResult.status === "rejected") {
       throw videoResult.reason;
     }
+    // Callers discard on false, so null here lets a silent file through as
+    // a success.
+    let audioCarried = null;
     if (pipeResults[1].status === "rejected") {
+      if (audioSource && audioTrack) audioCarried = false;
       devLog("audio-pipe-failed", {
         err: String(pipeResults[1].reason?.message || pipeResults[1].reason).slice(0, 200),
       });
@@ -228,7 +241,7 @@ const remuxToOpfs = async ({ requestId, inputFileName, outputFileName }) => {
       durationMs: Date.now() - startedAt,
       outputBytes: finalSize,
     });
-    postDone(requestId, outputFileName);
+    postDone(requestId, outputFileName, audioCarried);
   } catch (err) {
     devLog("error", {
       err: String(err?.message || err).slice(0, 200),
@@ -289,9 +302,20 @@ const convertViaEncoder = async (
 
     const writable = createOpfsWritable(syncHandle);
 
+    // Linux Chromium has no AAC encoder, so without the wasm one the MP4
+    // comes back silent.
+    if (targetFormat === "mp4") {
+      await ensureAacEncoder();
+    }
+
+    let audioDropped = false;
     const convertOptions = {
       target: new StreamTarget(writable),
       onProgress: (p) => postProgress(requestId, p),
+      onAudioDropped: (reason, codec) => {
+        audioDropped = true;
+        devLog(`${targetFormat}-audio-dropped`, { reason, codec });
+      },
     };
     // Without this the converter falls back to its 5 Mbps default, which is a
     // 1080p figure: a 4K screencast came back visibly blocky on text.
@@ -315,8 +339,14 @@ const convertViaEncoder = async (
     devLog(`${targetFormat}-done`, {
       durationMs: Date.now() - startedAt,
       outputBytes: finalSize,
+      audioCarried: audioDropped ? false : null,
     });
-    postDone(requestId, outputFileName);
+    postDone(
+      requestId,
+      outputFileName,
+      audioDropped ? false : null,
+      targetFormat === "mp4" ? getAacPath() : null,
+    );
   } catch (err) {
     devLog(`${targetFormat}-error`, {
       err: String(err?.message || err).slice(0, 200),

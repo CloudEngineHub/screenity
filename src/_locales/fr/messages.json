@@ -551,6 +551,22 @@
     "message": "Réessayer",
     "description": "Bouton de réessai de l'étiquette hors ligne"
   },
+  "serverIssueTitle": {
+    "message": "Screenity est indisponible",
+    "description": "Title shown when the Screenity API is returning server errors"
+  },
+  "serverIssueDescription": {
+    "message": "L'enregistrement dans le cloud est indisponible pour le moment. Réessayez dans quelques instants.",
+    "description": "Description shown when the Screenity API is returning server errors"
+  },
+  "serverUnreachableTitle": {
+    "message": "Impossible de joindre Screenity",
+    "description": "Title shown when the Screenity API cannot be reached"
+  },
+  "serverUnreachableDescription": {
+    "message": "Vérifiez votre connexion ou réessayez dans un instant.",
+    "description": "Description shown when the Screenity API cannot be reached"
+  },
   "updateChromeLabelTitle": {
     "message": "Chrome a besoin d'une mise à jour",
     "description": "Étiquette de mise à jour de Chrome"

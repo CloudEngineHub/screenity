@@ -16,32 +16,58 @@ import { canStartMp4Recorder } from "../../utils/recorderCodec";
 // downstream (Bunny drops frames, node-av SIGSEGVs). false = VP9-WebM.
 const PREFER_MP4_MEDIARECORDER = true;
 
+// MediaRecorder's audio-only WebM carries no Duration, so players report
+// Infinity. false = WebM/Opus.
+const PREFER_MP4_AUDIO_MEDIARECORDER = true;
+
 // H.264 Baseline + AAC-LC. Video-only variant for audioless tracks;
 // isTypeSupported answers differently for the two, so probe both.
 const MP4_MR_WITH_AUDIO = "video/mp4;codecs=avc1.42E01E,mp4a.40.2";
 const MP4_MR_VIDEO_ONLY = "video/mp4;codecs=avc1.42E01E";
+// AAC-LC, audio-only. Pinned: a bare audio/mp4 records Opus-in-MP4 on
+// Chrome 151.
+const MP4_MR_AUDIO_ONLY = "audio/mp4;codecs=mp4a.40.2";
+
+const mimeSupported = (mime) => {
+  try {
+    return (
+      typeof MediaRecorder !== "undefined" &&
+      typeof MediaRecorder.isTypeSupported === "function" &&
+      MediaRecorder.isTypeSupported(mime)
+    );
+  } catch {
+    return false;
+  }
+};
 
 let _mp4MrSupport = null;
 const probeMp4MediaRecorder = () => {
   if (_mp4MrSupport !== null) return _mp4MrSupport;
-  const supported = (mime) => {
-    try {
-      return (
-        typeof MediaRecorder !== "undefined" &&
-        typeof MediaRecorder.isTypeSupported === "function" &&
-        MediaRecorder.isTypeSupported(mime)
-      );
-    } catch {
-      return false;
-    }
-  };
   _mp4MrSupport = PREFER_MP4_MEDIARECORDER
     ? {
-        withAudio: supported(MP4_MR_WITH_AUDIO),
-        videoOnly: supported(MP4_MR_VIDEO_ONLY),
+        withAudio: mimeSupported(MP4_MR_WITH_AUDIO),
+        videoOnly: mimeSupported(MP4_MR_VIDEO_ONLY),
       }
     : { withAudio: false, videoOnly: false };
   return _mp4MrSupport;
+};
+
+let _mp4AudioMrSupport = null;
+// TUS filetype is fixed at uploader init, so an MP4 start() that throws later
+// ships WebM bytes labelled audio/mp4. Probe the real mic stream here.
+const probeMp4AudioMediaRecorder = (stream = null) => {
+  if (_mp4AudioMrSupport !== null) return _mp4AudioMrSupport;
+  const typeOk =
+    PREFER_MP4_AUDIO_MEDIARECORDER && mimeSupported(MP4_MR_AUDIO_ONLY);
+  if (!typeOk) {
+    _mp4AudioMrSupport = false;
+    return false;
+  }
+  // No stream yet: report support without caching, so the first call that has
+  // one still gets to run the start probe.
+  if (!stream) return true;
+  _mp4AudioMrSupport = canStartMp4Recorder(stream, MP4_MR_AUDIO_ONLY);
+  return _mp4AudioMrSupport;
 };
 
 // Only claim MP4 when both variants record: the container is fixed before we
@@ -55,6 +81,7 @@ const mediaRecorderVideoPlan = () => {
 
 // Null for WebM: callers pass their existing mime through unchanged.
 export const mediaRecorderMimeFor = ({ container, enableAudio }) => {
+  if (container === "audio/mp4") return MP4_MR_AUDIO_ONLY;
   if (container !== "video/mp4") return null;
   return enableAudio ? MP4_MR_WITH_AUDIO : MP4_MR_VIDEO_ONLY;
 };
@@ -101,6 +128,7 @@ let _stickyStatePromise = null;
 export const resetEncoderProbeCache = () => {
   _hwSlotsPromise = null;
   _stickyStatePromise = null;
+  _mp4AudioMrSupport = null;
 };
 
 const ensureProbes = async (probeOptions) => {
@@ -125,14 +153,19 @@ const TRACK_TO_PROBE = {
 // BunnyTusUploader's TUS Upload-Metadata `filetype` can be set to the
 // container the upcoming recorder will produce. Both inspectTrackPlan
 // and chooseTrackEncoder hit the same probe cache, so they always agree.
-export const inspectTrackPlan = async ({ track, probeOptions }) => {
+export const inspectTrackPlan = async ({ track, probeOptions, stream = null }) => {
+  // Audio never uses WebCodecs: screen + camera already contend for the
+  // H.264 slots. MP4 here is a muxer swap inside MediaRecorder, not an encoder.
   if (track === "audio") {
+    const mp4 = probeMp4AudioMediaRecorder(stream);
     return {
       kind: "mediarecorder",
-      container: "video/webm",
-      codec: "opus",
+      // WebM fallback keeps reporting video/webm, the filetype these
+      // tracks have always uploaded under.
+      container: mp4 ? "audio/mp4" : "video/webm",
+      codec: mp4 ? "mp4a.40.2" : "opus",
       hwSlots: null,
-      reason: "audio-track-fixed",
+      reason: mp4 ? "audio-track-mp4" : "audio-track-webm",
     };
   }
   const [hwSlots, sticky] = await ensureProbes(probeOptions || {});
@@ -153,18 +186,17 @@ export const inspectTrackPlan = async ({ track, probeOptions }) => {
       reason: `hw-probe-${track}-unsupported`,
     };
   }
-  // MP4/WebCodecs can't carry audio without AAC. When AAC encode is missing
-  // (rare: Chromium with H.264 but no proprietary AAC) the WebCodecs path
-  // would produce a silent MP4, so route video tracks to MediaRecorder
-  // (VP9-WebM), which records audio natively. AAC support is device-global, so
-  // both inspectTrackPlan callers (TUS filetype hint and recorder) agree.
+  // Linux Chromium has no AAC, so MP4 would be silent. WebM/Opus, not
+  // MediaRecorder, whose VFR output jitters on render.
   // `=== false` so an older cached probe without the field fails open.
   if (hwSlots.summary.aacSupported === false) {
     return {
-      kind: "mediarecorder",
-      ...mediaRecorderVideoPlan(),
+      kind: "webcodecs",
+      container: "video/webm",
+      containerKind: "webm",
+      codec: "vp9",
       hwSlots: hwSlots.summary,
-      reason: "aac-unsupported",
+      reason: "aac-unsupported-webm",
     };
   }
   if (track === "camera" && hwSlots.summary.mode === "screen-hw-camera-mr") {
@@ -214,7 +246,7 @@ export const chooseTrackEncoder = async ({
   onDataAvailable,
   probeOptions,
 }) => {
-  const plan = await inspectTrackPlan({ track, probeOptions });
+  const plan = await inspectTrackPlan({ track, probeOptions, stream });
 
   if (plan.kind === "mediarecorder") {
     // Use the plan's mime so bytes match the container we already reported (TUS
@@ -229,7 +261,7 @@ export const chooseTrackEncoder = async ({
     if (planMime && !canStartMp4Recorder(stream, planMime)) {
       planMime = null;
       plan.container = "video/webm";
-      plan.codec = "vp9";
+      plan.codec = track === "audio" ? "opus" : "vp9";
       plan.reason = `${plan.reason}+mp4-start-probe-failed`;
     }
     return {
@@ -243,8 +275,8 @@ export const chooseTrackEncoder = async ({
     };
   }
 
-  // WebCodecs path. The MP4 mime type is always video/mp4, regardless of
-  // whether audio is included (AAC fits inside MP4 alongside H.264).
+  // WebCodecs path: MP4 stays video/mp4 with or without audio. WebM is the
+  // no-AAC fallback, carrying VP9 + Opus instead.
   // forceSoftwareEncoder storage flag biases the encoder candidate list
   // toward prefer-software. Playwright Chromium 1217 hits a documented
   // "encode() accepts, no chunks emit" HW silent-fail (see Windows MFT
@@ -255,8 +287,10 @@ export const chooseTrackEncoder = async ({
     const s = await chrome.storage.local.get(["forceSoftwareEncoder"]);
     forceSoftware = Boolean(s.forceSoftwareEncoder);
   } catch {}
+  const containerKind = plan.containerKind === "webm" ? "webm" : "mp4";
   const recorder = new WebCodecsTrackRecorder(stream, {
-    mimeType: "video/mp4",
+    mimeType: containerKind === "webm" ? "video/webm" : "video/mp4",
+    containerKind,
     videoBitsPerSecond,
     audioBitsPerSecond,
     audioChannels,

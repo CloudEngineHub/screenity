@@ -551,6 +551,22 @@
     "message": "Spróbuj ponownie",
     "description": "Przycisk etykiety offline Spróbuj ponownie"
   },
+  "serverIssueTitle": {
+    "message": "Screenity jest niedostępne",
+    "description": "Title shown when the Screenity API is returning server errors"
+  },
+  "serverIssueDescription": {
+    "message": "Nagrywanie w chmurze jest chwilowo niedostępne. Spróbuj ponownie za chwilę.",
+    "description": "Description shown when the Screenity API is returning server errors"
+  },
+  "serverUnreachableTitle": {
+    "message": "Nie można połączyć się ze Screenity",
+    "description": "Title shown when the Screenity API cannot be reached"
+  },
+  "serverUnreachableDescription": {
+    "message": "Sprawdź połączenie lub spróbuj ponownie za chwilę.",
+    "description": "Description shown when the Screenity API cannot be reached"
+  },
   "updateChromeLabelTitle": {
     "message": "Konieczna aktualizacja Chrome'a",
     "description": "Etykieta aktualizacji Chrome'a"

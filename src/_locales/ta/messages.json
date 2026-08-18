@@ -551,6 +551,22 @@
     "message": "மீண்டும் முயற்சி செய்",
     "description": "ஆஃப்லைன் லேபிள் மீண்டும் முயற்சி செய் பொத்தான்"
   },
+  "serverIssueTitle": {
+    "message": "Screenity கிடைக்கவில்லை",
+    "description": "Title shown when the Screenity API is returning server errors"
+  },
+  "serverIssueDescription": {
+    "message": "கிளவுட் பதிவு தற்போது கிடைக்கவில்லை. சிறிது நேரம் கழித்து மீண்டும் முயற்சிக்கவும்.",
+    "description": "Description shown when the Screenity API is returning server errors"
+  },
+  "serverUnreachableTitle": {
+    "message": "Screenity ஐ அணுக முடியவில்லை",
+    "description": "Title shown when the Screenity API cannot be reached"
+  },
+  "serverUnreachableDescription": {
+    "message": "உங்கள் இணைப்பைச் சரிபார்க்கவும் அல்லது சிறிது நேரம் கழித்து மீண்டும் முயற்சிக்கவும்.",
+    "description": "Description shown when the Screenity API cannot be reached"
+  },
   "updateChromeLabelTitle": {
     "message": "கூகுள் புதுப்பிக்க வேண்டும்",
     "description": "கைப்பு கூகுள் புதுப்பிப்பு லேபிள்"

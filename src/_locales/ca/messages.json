@@ -551,6 +551,22 @@
     "message": "Torna-ho a provar",
     "description": "Botó de tornar-ho a provar de l'etiqueta sense connexió"
   },
+  "serverIssueTitle": {
+    "message": "Screenity no està disponible",
+    "description": "Title shown when the Screenity API is returning server errors"
+  },
+  "serverIssueDescription": {
+    "message": "L'enregistrament al núvol no està disponible ara mateix. Torna-ho a provar d'aquí a poc.",
+    "description": "Description shown when the Screenity API is returning server errors"
+  },
+  "serverUnreachableTitle": {
+    "message": "No es pot connectar amb Screenity",
+    "description": "Title shown when the Screenity API cannot be reached"
+  },
+  "serverUnreachableDescription": {
+    "message": "Comprova la connexió o torna-ho a provar d'aquí a un moment.",
+    "description": "Description shown when the Screenity API cannot be reached"
+  },
   "updateChromeLabelTitle": {
     "message": "Cal actualitzar Chrome",
     "description": "Etiqueta d'actualització de Chrome"

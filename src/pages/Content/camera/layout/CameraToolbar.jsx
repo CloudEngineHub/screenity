@@ -10,6 +10,8 @@ import { contentStateContext } from "../../context/ContentState";
 
 const CameraToolbar = () => {
   const [contentState, setContentState] = useContext(contentStateContext);
+  const pipSupported =
+    typeof document !== "undefined" && document.pictureInPictureEnabled;
 
   return (
     <Toolbar.Root className="camera-toolbar">
@@ -25,7 +27,10 @@ const CameraToolbar = () => {
       >
         <CameraCloseIcon />
       </Toolbar.Button>
-      {contentState.recording && contentState.surface === "monitor" && (
+      {/* Manual toggle, deliberately not gated on surface or recordingType.
+          Auto-PiP is decided in surfaceHandler; this is the way back into PiP
+          after closing it, and `surface` is not reliably set on every flow. */}
+      {pipSupported && (
         <TooltipWrap
           content={chrome.i18n.getMessage("togglePictureinPictureModeTooltip")}
         >

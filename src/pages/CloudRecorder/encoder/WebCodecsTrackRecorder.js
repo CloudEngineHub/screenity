@@ -19,6 +19,8 @@ export class WebCodecsTrackRecorder {
   constructor(stream, options = {}) {
     this.stream = stream;
     this.mimeType = options.mimeType || "video/mp4";
+    // WebM is the no-AAC fallback (Linux), carrying VP9 + Opus.
+    this.containerKind = options.containerKind === "webm" ? "webm" : "mp4";
     this.videoBitsPerSecond =
       options.videoBitsPerSecond || 16_000_000;
     this.audioBitsPerSecond = options.audioBitsPerSecond || 128_000;
@@ -177,13 +179,17 @@ export class WebCodecsTrackRecorder {
       } catch {}
     };
 
-    // Screen only: the prewarm is sized and hardware-preferred for screen,
-    // and cloud's camera track is often forced to software anyway.
+    // Screen only: camera is often forced to software. The warm encoder is
+    // H.264 and claimPrewarmedEncoder doesn't check codec, so WebM/VP9 can't adopt.
     const adoptPrewarm =
-      isWarmAdoptEnabled() && this.trackKind === "screen" && !this.preferSoftware;
+      isWarmAdoptEnabled() &&
+      this.trackKind === "screen" &&
+      !this.preferSoftware &&
+      this.containerKind !== "webm";
 
     this._recorder = new WebCodecsRecorder(this.stream, {
       allowPrewarmAdopt: adoptPrewarm,
+      containerKind: this.containerKind,
       onChunk: handleChunk,
       onFinalized: handleFinalized,
       onError: handleError,

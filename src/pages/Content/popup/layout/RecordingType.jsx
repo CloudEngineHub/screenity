@@ -9,8 +9,9 @@ import { CameraOffBlue, MicOffBlue } from "../../images/popup/images";
 import TooltipWrap from "../components/TooltipWrap";
 
 import BackgroundEffects from "../components/BackgroundEffects";
+import ApiIssueWarning from "../components/ApiIssueWarning";
 
-import { AlertIcon, TimeIcon, NoInternet } from "../../toolbar/components/SVG";
+import { AlertIcon, TimeIcon } from "../../toolbar/components/SVG";
 
 const CLOUD_FEATURES_ENABLED =
   process.env.SCREENITY_ENABLE_CLOUD_FEATURES === "true";
@@ -131,22 +132,7 @@ const RecordingType = (props) => {
           </div>
         </div>
       )}
-      {/*contentState.offline && (
-        <div className="popup-warning">
-          <div className="popup-warning-left">
-            <NoInternet />
-          </div>
-          <div className="popup-warning-middle">
-            <div className="popup-warning-title">You are currently offline</div>
-            <div className="popup-warning-description">
-              Some features are unavailable
-            </div>
-          </div>
-          <div className="popup-warning-right">
-            <a href="#">Try again</a>
-          </div>
-        </div>
-			)*/}
+      <ApiIssueWarning />
       {!cropActive &&
         contentState.recordingType === "region" &&
         !contentState.offline && (

@@ -13,6 +13,7 @@ import {
   destroySessionDir,
 } from "../CloudRecorder/recorderStorage/opfsKvStore";
 import { handleGetStreamingData } from "./recording/recordingHelpers";
+import { initUninstallSurvey } from "./utils/uninstallSurvey";
 
 // Don't tear down an in-flight start on SW restart: a fresh start is
 // mid-setup (recorder tab not loaded yet), not dead. Mirrors the alarm
@@ -332,6 +333,7 @@ setupHandlers();
 initCountdownFallback();
 initKeepAwake();
 initLifecycleObserver();
+initUninstallSurvey();
 
 // Recovery must run AFTER clearStaleLocks: if the recorder tab died
 // with the SW, clearStaleLocks clears pendingRecording and recovery

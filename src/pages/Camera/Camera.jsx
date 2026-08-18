@@ -187,10 +187,20 @@ const Camera = () => {
     if (!videoRef.current || !streamRef.current?.active) return;
 
     chrome.storage.local.get(
-      ["surface", "recording"],
+      ["surface", "recording", "isSubscribed", "instantMode", "recordingType"],
       (result) => {
         if (result.recording && result.surface) {
-          surfaceHandler({ surface: result.surface }, videoRef);
+          // Without these two surfaceHandler reads the plan as free, and a Pro
+          // monitor recording enters PiP with the camera burnt into the capture.
+          surfaceHandler(
+            {
+              surface: result.surface,
+              subscribed: Boolean(result.isSubscribed),
+              instantMode: Boolean(result.instantMode),
+              recordingType: result.recordingType || null,
+            },
+            videoRef,
+          );
         }
       },
     );

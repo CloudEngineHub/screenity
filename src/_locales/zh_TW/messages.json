@@ -551,6 +551,22 @@
     "message": "再試一次",
     "description": "Offline label try again button"
   },
+  "serverIssueTitle": {
+    "message": "Screenity 暫時無法使用",
+    "description": "Title shown when the Screenity API is returning server errors"
+  },
+  "serverIssueDescription": {
+    "message": "雲端錄影暫時無法使用，請稍後再試。",
+    "description": "Description shown when the Screenity API is returning server errors"
+  },
+  "serverUnreachableTitle": {
+    "message": "無法連線至 Screenity",
+    "description": "Title shown when the Screenity API cannot be reached"
+  },
+  "serverUnreachableDescription": {
+    "message": "請檢查網路連線，或稍後再試。",
+    "description": "Description shown when the Screenity API cannot be reached"
+  },
   "updateChromeLabelTitle": {
     "message": "Chrome 需要更新",
     "description": "Update Chrome label"
