@@ -11,6 +11,10 @@ const INJECT_CONCURRENCY = 3;
 // background time instead of a pinned CPU.
 const BACKFILL_CONCURRENCY = 1;
 const BACKFILL_GAP_MS = 250;
+// sendMessage never settles while a tab is still loading, so an unbounded
+// ping parks a worker forever. Shorter on the click path.
+const PING_TIMEOUT_MS = 750;
+const BACKFILL_PING_TIMEOUT_MS = 2000;
 
 
 // executeScript resolves as a promise only when no callback is passed. The
@@ -51,17 +55,14 @@ export const injectContentScriptIntoTab = async (tabId) => {
   }
 };
 
-// The backfill is no longer guaranteed to have reached the tab, so callers
-// can't assume a content script is there.
+// Pings first: a blind send to a loading tab hangs instead of erroring, which
+// is what made the popup take minutes. A resend would toggle the popup twice.
 export const sendMessageEnsuringContentScript = async (tabId, message) => {
   const { sendMessageTab } = await import("../tabManagement");
-  try {
-    return await sendMessageTab(tabId, message);
-  } catch (err) {
-    if (!String(err).includes("Receiving end does not exist")) throw err;
-  }
-  if (!(await injectContentScriptIntoTab(tabId))) {
-    throw new Error(`content script injection failed for tab ${tabId}`);
+  if (!(await hasContentScript(tabId))) {
+    if (!(await injectContentScriptIntoTab(tabId))) {
+      throw new Error(`content script injection failed for tab ${tabId}`);
+    }
   }
   return sendMessageTab(tabId, message);
 };
@@ -76,13 +77,28 @@ const injectionPriority = (tab, focusedWindowId) => {
 
 // Skips the ~1MB re-parse when the script is already there. Only absence
 // reads "Receiving end does not exist", so any other reply means it is.
-const hasContentScript = async (tabId) => {
+// A timeout counts as absent. Injection is deduped by
+// window.__screenityContentBootstrapped, so guessing wrong costs one parse.
+const hasContentScript = async (tabId, timeoutMs = PING_TIMEOUT_MS) => {
   const { sendMessageTab } = await import("../tabManagement");
+  let timer = null;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), timeoutMs);
+  });
   try {
-    await sendMessageTab(tabId, { type: "screenity-ping" });
-    return true;
-  } catch (err) {
-    return !String(err).includes("Receiving end does not exist");
+    const result = await Promise.race([
+      sendMessageTab(tabId, { type: "screenity-ping" }).then(
+        () => "present",
+        (err) =>
+          String(err).includes("Receiving end does not exist")
+            ? "absent"
+            : "present",
+      ),
+      timeout,
+    ]);
+    return result === "present";
+  } finally {
+    clearTimeout(timer);
   }
 };
 
@@ -106,7 +122,8 @@ const injectIfMissing = async (tabId, files, gapMs = 0) => {
   while (gapMs > 0 && (await recordingInFlight())) {
     await new Promise((r) => setTimeout(r, 2000));
   }
-  if (await hasContentScript(tabId)) return;
+  if (await hasContentScript(tabId, gapMs > 0 ? BACKFILL_PING_TIMEOUT_MS : PING_TIMEOUT_MS))
+    return;
   await injectInto(tabId, files);
   if (gapMs > 0) await new Promise((r) => setTimeout(r, gapMs));
 };

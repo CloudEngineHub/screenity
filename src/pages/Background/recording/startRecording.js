@@ -469,10 +469,14 @@ const _startRecordingInner = async (caller) => {
         setTimeout(recheck, RECHECK_INTERVAL_MS);
         return;
       }
+      // No writer at all reads the same as a stalled one, so keep them apart.
+      const stalledStage = isThisStart
+        ? String(progress.stage || "unknown").slice(0, 40)
+        : "none";
       if (isThisStart) {
         diagEvent("warning", {
           note: "start-fail after progress stalled",
-          stage: String(progress.stage || "").slice(0, 40),
+          stage: stalledStage,
           stalledMs: Date.now() - progress.ts,
         });
       }
@@ -491,6 +495,16 @@ const _startRecordingInner = async (caller) => {
         region: Boolean(customRegion),
         error: errStr,
         staleTab: isStaleTab,
+      });
+      // diagEvent only reaches the local ring buffer, which is never uploaded.
+      // reason is the one field that survives both telemetry allowlists.
+      void emitRecordingTelemetry("recording_forensic_event", {
+        recordingSessionId: recordingAttemptId,
+        name: "start-fail-progress",
+        reason: `start-progress-${stalledStage}`,
+        stalledMs: isThisStart ? Date.now() - progress.ts : null,
+        elapsedMs: Date.now() - startDispatchedAt,
+        errMsg: errStr,
       });
       releaseStartRecordingGuard();
       chrome.storage.local.set({

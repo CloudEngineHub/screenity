@@ -3,6 +3,7 @@
 // used to post, so ContentState's result handlers fire unchanged.
 // Each video op is lazy-loaded to keep the ~630KB mediabunny chunk off mount.
 import { fixWebmDurationOffThread } from "../Editor/utils/fixWebmDurationOffThread";
+import { blobHasAudioTrack } from "../utils/hasAudioTrack";
 
 const lazyUtil = (importFn) =>
   (...args) =>
@@ -165,6 +166,22 @@ export async function runEditorOp(message, reply, { viewer = false } = {}) {
         const looksMp4 = header === "ftyp";
 
         if (looksMp4) {
+          reply({
+            type: "updated-blob",
+            base64: message.base64,
+            topLevel: true,
+          });
+          break;
+        }
+
+        // A silent MP4 is worse than the WebM it came from, so keep the source
+        // when AAC is missing and the recording actually has sound.
+        let aacOk = false;
+        try {
+          const { ensureAacEncoder } = await import("../utils/aacPolyfill");
+          aacOk = await ensureAacEncoder();
+        } catch {}
+        if (!aacOk && (await blobHasAudioTrack(rawBlob))) {
           reply({
             type: "updated-blob",
             base64: message.base64,

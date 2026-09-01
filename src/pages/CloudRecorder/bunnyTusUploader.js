@@ -184,6 +184,36 @@ export default class BunnyTusUploader {
     // instead of silently truncating; the throw inside write() is
     // unobserved because MediaRecorder.ondataavailable is fire-and-forget.
     this.bytesLostAfterFinalize = 0;
+
+    // PATCH accounting. Without it a stall report cannot tell a dead loop
+    // from a hanging request, and those two need opposite fixes.
+    this.patchAttempts = 0;
+    this.patchResponses = 0;
+    this.patchThrows = 0;
+    this.patchInFlight = false;
+    this.lastPatchStartedAt = null;
+    this.lastPatchEndedAt = null;
+    this.lastPatchStatus = null;
+    this.lastPatchOutcome = null;
+  }
+
+  // Flat and bounded so both telemetry allowlists can carry it verbatim.
+  patchStats() {
+    const now = Date.now();
+    return {
+      patchAttempts: this.patchAttempts,
+      patchResponses: this.patchResponses,
+      patchThrows: this.patchThrows,
+      patchInFlight: this.patchInFlight,
+      lastPatchStatus: this.lastPatchStatus,
+      lastPatchOutcome: this.lastPatchOutcome,
+      sinceLastPatchStartMs: this.lastPatchStartedAt
+        ? now - this.lastPatchStartedAt
+        : null,
+      sinceLastPatchEndMs: this.lastPatchEndedAt
+        ? now - this.lastPatchEndedAt
+        : null,
+    };
   }
 
   debugLog(message, payload = null) {
@@ -259,6 +289,7 @@ export default class BunnyTusUploader {
     this.emitTelemetry("upload_error", {
       errorCode: errorCode || null,
       message: err?.message || this.error || "upload-error",
+      ...this.patchStats(),
       ...(extra && typeof extra === "object" ? extra : {}),
     });
     this.scheduleJournalPersist({ force: true });
@@ -476,6 +507,7 @@ export default class BunnyTusUploader {
       lastErrorCode: this.lastErrorCode || null,
       lastServerOffset: this.lastServerOffset || 0,
       resumeCount: this.resumeCount || 0,
+      ...this.patchStats(),
     };
 
     const toStore = {
@@ -638,11 +670,32 @@ export default class BunnyTusUploader {
     return null;
   }
 
+  // prepareGapResend refuses while the queue is live, so callers quiesce first.
+  // Bounded: a queue that never settles must skip the re-send, not hang stop.
+  async waitForInFlightChunk(timeoutMs = 15000) {
+    const deadline = Date.now() + timeoutMs;
+    while (this.currentPatchAbort || this.isProcessingQueue) {
+      if (Date.now() >= deadline) return false;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return true;
+  }
+
   // Rewinds local accounting to server truth, else write() trips the
   // server-offset-regressed guard on the first re-sent PATCH.
   prepareGapResend(serverOffset) {
     if (!Number.isFinite(serverOffset) || serverOffset < 0) return false;
     if (this.isFinalizing) return false;
+    // A PATCH that returns after the rewind sets this.offset from its own
+    // pre-rewind value, which undoes it silently. Refuse rather than corrupt.
+    if (this.currentPatchAbort || this.isProcessingQueue) {
+      this.emitTelemetry("upload_gap_resend_blocked", {
+        reason: this.currentPatchAbort ? "patch-in-flight" : "queue-processing",
+        serverOffset,
+        clientOffset: this.offset,
+      });
+      return false;
+    }
     this.chunkQueue = [];
     this.queuedBytes = 0;
     this.offset = serverOffset;
@@ -713,7 +766,7 @@ export default class BunnyTusUploader {
     if (this._offsetDivergenceCount >= 2) {
       // Deliberately not rewriting this.offset down: PATCHing from the server's
       // offset would skip the missing bytes and mux a hole into the file.
-      this.setUploaderError("server-offset-behind-client", {
+      this.setUploaderError("server-offset-behind-client", null, {
         clientOffset: this.offset,
         serverOffset,
         divergence,
@@ -1312,6 +1365,9 @@ export default class BunnyTusUploader {
           this.UPLOAD_TIMEOUT_MS,
         );
 
+        this.patchAttempts += 1;
+        this.patchInFlight = true;
+        this.lastPatchStartedAt = Date.now();
         const res = await fetch(this.uploadUrl, {
           // Followed silently by default: a proxy or captive-portal 3xx sends
           // the chunk and signature onward, and its 200 reads as a good write.
@@ -1331,6 +1387,12 @@ export default class BunnyTusUploader {
         });
         clearTimeout(timeout);
         this.currentPatchAbort = null;
+        this.patchInFlight = false;
+        this.patchResponses += 1;
+        this.lastPatchEndedAt = Date.now();
+        this.lastPatchStatus = res.status;
+        this.lastPatchOutcome =
+          res.ok || res.status === 204 ? "2xx" : `http-${res.status}`;
 
         if (res.ok || res.status === 204) {
           const serverOffsetHeader = res.headers.get("Upload-Offset");
@@ -1346,11 +1408,15 @@ export default class BunnyTusUploader {
               parsed < currentOffset ||
               parsed > expectedOffset
             ) {
-              this.setUploaderError("invalid-server-offset", {
-                serverOffsetHeader,
-                parsed,
-                currentOffset,
-                expectedOffset,
+              this.setUploaderError("invalid-server-offset", null, {
+                clientOffset: currentOffset,
+                serverOffset: Number.isFinite(parsed) ? parsed : null,
+                httpStatus: res.status,
+                // Raw header has no allowlisted home and is unvetted server
+                // text, so it rides reason bounded.
+                reason: `invalid-offset-header-${String(
+                  serverOffsetHeader,
+                ).slice(0, 32)}-expected-${expectedOffset}`,
               });
               throw new Error(
                 `Invalid Upload-Offset from server: "${serverOffsetHeader}"`,
@@ -1360,6 +1426,7 @@ export default class BunnyTusUploader {
               // Short write. Counting it as a full one is what let a camera
               // track discard 10k chunks while pinned at offset 28.
               const acceptedBytes = parsed - currentOffset;
+              this.lastPatchOutcome = `short-write-${acceptedBytes}`;
               this.offset = parsed;
               this.lastServerOffset = parsed;
               this.noServerProgressCount =
@@ -1380,9 +1447,11 @@ export default class BunnyTusUploader {
                 resUrlMatches: res.url === this.uploadUrl,
               });
               if (this.noServerProgressCount >= 3) {
-                this.setUploaderError("server-offset-not-advancing", {
-                  parsed,
-                  currentOffset,
+                this.setUploaderError("server-offset-not-advancing", null, {
+                  clientOffset: currentOffset,
+                  serverOffset: parsed,
+                  httpStatus: res.status,
+                  reason: `offset-stuck-at-${parsed}-streak-${this.noServerProgressCount}`,
                 });
                 throw new Error(`Server offset stuck at ${parsed}`);
               }
@@ -1506,9 +1575,11 @@ export default class BunnyTusUploader {
                 // if it is, server state is corrupted. Fail loudly.
                 const priorOffset = this.offset;
                 if (serverOffset < priorOffset - data.length) {
-                  this.setUploaderError("server-offset-regressed", {
+                  this.setUploaderError("server-offset-regressed", null, {
+                    clientOffset: priorOffset,
                     serverOffset,
-                    priorOffset,
+                    divergence: priorOffset - serverOffset,
+                    httpStatus: res.status,
                   });
                   throw new Error(
                     `Server offset regressed (${serverOffset} < ${priorOffset})`,
@@ -1560,8 +1631,10 @@ export default class BunnyTusUploader {
                 continue;
               }
               // serverOffset null/NaN: HEAD response unparseable.
-              this.setUploaderError("offset-conflict-head-unparseable", {
-                priorOffset: this.offset,
+              this.setUploaderError("offset-conflict-head-unparseable", null, {
+                clientOffset: this.offset,
+                httpStatus: res.status,
+                reason: "offset-conflict-head-unparseable",
               });
               throw new Error(
                 "409 offset conflict but HEAD returned unparseable offset",
@@ -1586,6 +1659,14 @@ export default class BunnyTusUploader {
             ? controller.signal.reason
             : null;
         this.currentPatchAbort = null;
+        if (this.patchInFlight) {
+          this.patchInFlight = false;
+          this.patchThrows += 1;
+          this.lastPatchEndedAt = Date.now();
+          this.lastPatchOutcome = String(
+            abortReason || err?.name || "throw",
+          ).slice(0, 40);
+        }
         // Transient errors (network/timeout/stall-abort/5xx/408/423/425/429)
         // retry forever with capped backoff. 423 = Bunny's resource lock.
         const isExplicitAbort =
@@ -1618,7 +1699,8 @@ export default class BunnyTusUploader {
             err,
           );
           this.setUploaderError("chunk-upload-retries-exhausted", err, {
-            abortReason,
+            clientOffset: this.offset,
+            reason: `retries-exhausted-${abortReason || "none"}`,
           });
           throw err;
         }
@@ -1677,10 +1759,10 @@ export default class BunnyTusUploader {
     }
     // Falling out means the chunk never fully landed. Returning here reads as
     // success to processQueue, which then shifts the next chunk over the gap.
-    this.setUploaderError(exhaustedReason, {
-      chunkStartOffset,
-      remaining: data.length,
-      shortWritePasses,
+    this.setUploaderError(exhaustedReason, null, {
+      clientOffset: this.offset,
+      serverOffset: this.lastServerOffset ?? null,
+      reason: `${exhaustedReason}-from-${chunkStartOffset}-remaining-${data.length}-passes-${shortWritePasses}`,
     });
     throw new Error(`Chunk upload did not complete (${exhaustedReason})`);
     } catch (err) {
@@ -2087,6 +2169,8 @@ export default class BunnyTusUploader {
         this.stalled = true;
         this.emitTelemetry("upload_stalled", {
           stallMs: diff,
+          queueLength: this.chunkQueue.length,
+          ...this.patchStats(),
         });
         this.scheduleJournalPersist({ force: true });
         if (typeof this.onStall === "function") {

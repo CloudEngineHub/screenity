@@ -120,6 +120,31 @@ export const computeEncodedDimensions = ({
   return { width: targetWidth, height: targetHeight };
 };
 
+// Webcam noise is incompressible, so a 640x480 camera took the flat 16 Mbps
+// target at its word: 13 Mbps, 1.4 bpp against 0.1-0.2 for good 480p H.264.
+const CAMERA_BITRATE_RUNGS = [
+  { maxPixels: 854 * 480, bitrate: 2_000_000 },
+  { maxPixels: 1280 * 720, bitrate: 4_000_000 },
+];
+// The web recorder uses the same ladder. Keep both sides in step.
+const CAMERA_BITRATE_MAX = 6_000_000;
+
+// Takes ENCODED dims, not captured. computeEncodedDimensions caps the camera
+// at 1920x1080, so the top rung also answers unknown dimensions.
+export const computeCameraBitrate = ({ width, height } = {}) => {
+  if (
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    width <= 0 ||
+    height <= 0
+  ) {
+    return CAMERA_BITRATE_MAX;
+  }
+  const pixels = width * height;
+  const rung = CAMERA_BITRATE_RUNGS.find((r) => pixels <= r.maxPixels);
+  return rung ? rung.bitrate : CAMERA_BITRATE_MAX;
+};
+
 // memoize per-session: chooseTrackEncoder() runs once per track during
 // start, so the probe fires three times back-to-back without this cache.
 let _hwSlotsPromise = null;

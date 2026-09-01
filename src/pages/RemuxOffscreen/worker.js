@@ -18,6 +18,7 @@ import {
 import { createOpfsWritable } from "./opfsTarget";
 import { videoConverter } from "../Editor/mediabunny/lib/videoConverter";
 import { ensureAacEncoder, getAacPath } from "../utils/aacPolyfill";
+import { blobHasAudioTrack } from "../utils/hasAudioTrack";
 
 const TEMP_FILE_PREFIX = "remux-";
 const STALE_AGE_MS = 5 * 60 * 1000;
@@ -305,7 +306,14 @@ const convertViaEncoder = async (
     // Linux Chromium has no AAC encoder, so without the wasm one the MP4
     // comes back silent.
     if (targetFormat === "mp4") {
-      await ensureAacEncoder();
+      const aacOk = await ensureAacEncoder();
+      // Registering alone makes mediabunny report AAC as encodable, so a
+      // broken encoder ships a silent MP4 instead of dropping the track.
+      if (!aacOk && (await blobHasAudioTrack(inputFile))) {
+        const err = new Error("mp4 transcode needs AAC and none is usable");
+        err.code = "aac-unavailable";
+        throw err;
+      }
     }
 
     let audioDropped = false;

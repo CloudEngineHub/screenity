@@ -21,6 +21,7 @@ import {
   stopTabKeepalive,
 } from "../utils/tabKeepalive";
 import { traceStep } from "../utils/startFlowTrace";
+import { markStartProgress } from "../utils/startProgress";
 import { IS_OFFSCREEN_HOST } from "../utils/recordingHost";
 import { sendSystemAudioGuidanceToast } from "../utils/systemAudioGuidance";
 import {
@@ -41,9 +42,14 @@ import {
 } from "./recorderStorage/chooseChunksStore";
 import { destroySessionDir } from "./recorderStorage/opfsKvStore";
 import {
+  createTrackStallState,
+  sweepTrackStalls,
+} from "./trackStallSweep";
+import {
   chooseTrackEncoder,
   resetEncoderProbeCache,
   computeEncodedDimensions,
+  computeCameraBitrate,
   WEBCODECS_CAP_WIDTH,
   WEBCODECS_CAP_HEIGHT,
 } from "./encoder/chooseEncoder";
@@ -91,9 +97,9 @@ const RESUMABLE_UPLOADER_STATUSES = new Set([
 ]);
 // Stop is user-visible, so the pre-finalize gap re-send is capped.
 const GAP_RESEND_BUDGET_MS = 45000;
-// Off until prepareGapResend gets an in-flight guard: it rewinds offset against
-// a live queue, which corrupts instead of failing.
-const GAP_RESEND_ENABLED = false;
+// prepareGapResend refuses to rewind under an in-flight PATCH, and the call
+// site quiesces the queue before reading the offset it plans against.
+const GAP_RESEND_ENABLED = true;
 const SCREEN_CHUNK_MEMORY_WINDOW = 8;
 const CAMERA_CHUNK_MEMORY_WINDOW = 8;
 const AUDIO_CHUNK_MEMORY_WINDOW = 8;
@@ -357,6 +363,10 @@ const CloudRecorder = () => {
   const sessionHeartbeat = useRef(null);
   const chunkStallTimer = useRef(null);
   const uploadHeartbeatTimer = useRef(null);
+  const trackSweepTicks = useRef(0);
+  // Set when the resend budget expires. finalize starts the moment the outer
+  // race resolves, and a write landing after that is lost bytes.
+  const gapResendAbortRef = useRef(false);
   const lastUploadProgress = useRef({
     screen: 0,
     camera: 0,
@@ -798,6 +808,48 @@ const CloudRecorder = () => {
         // One id per host (page load). Two ids on one bunnyVideoId means two
         // writers. The same id twice means one host re-signed.
         clientSessionId: eventPayload.clientSessionId || null,
+        trackSweepTicks:
+          typeof eventPayload.trackSweepTicks === "number"
+            ? eventPayload.trackSweepTicks
+            : null,
+        queueLength:
+          typeof eventPayload.queueLength === "number"
+            ? eventPayload.queueLength
+            : null,
+        // PATCH accounting. This shaper has no passthrough, so a field that
+        // is not named here never leaves the extension.
+        patchAttempts:
+          typeof eventPayload.patchAttempts === "number"
+            ? eventPayload.patchAttempts
+            : null,
+        patchResponses:
+          typeof eventPayload.patchResponses === "number"
+            ? eventPayload.patchResponses
+            : null,
+        patchThrows:
+          typeof eventPayload.patchThrows === "number"
+            ? eventPayload.patchThrows
+            : null,
+        patchInFlight:
+          typeof eventPayload.patchInFlight === "boolean"
+            ? eventPayload.patchInFlight
+            : null,
+        lastPatchStatus:
+          typeof eventPayload.lastPatchStatus === "number"
+            ? eventPayload.lastPatchStatus
+            : null,
+        lastPatchOutcome:
+          typeof eventPayload.lastPatchOutcome === "string"
+            ? eventPayload.lastPatchOutcome
+            : null,
+        sinceLastPatchStartMs:
+          typeof eventPayload.sinceLastPatchStartMs === "number"
+            ? eventPayload.sinceLastPatchStartMs
+            : null,
+        sinceLastPatchEndMs:
+          typeof eventPayload.sinceLastPatchEndMs === "number"
+            ? eventPayload.sinceLastPatchEndMs
+            : null,
         // Allowlisting here is necessary but not sufficient: the server sanitizer
         // needs them too. Folded into `reason`, which survives either way.
         queuedBytes:
@@ -1101,6 +1153,8 @@ const CloudRecorder = () => {
       serverBytesConfirmed,
       uploaderType: "cloud_recorder",
       encodeStats,
+      // recording_outcome always lands, unlike upload_track_stalled itself.
+      trackSweepTicks: trackSweepTicks.current,
       ...extra,
     });
   };
@@ -2635,6 +2689,11 @@ const CloudRecorder = () => {
       return;
     }
     try {
+      // The plan is built from this HEAD, so the queue has to stop moving
+      // before it is read or the rewind lands under a live PATCH.
+      if (typeof uploader.waitForInFlightChunk === "function") {
+        await uploader.waitForInFlightChunk();
+      }
       const serverOffset = await uploader.getServerOffset();
       if (serverOffset === null) return;
       const clientBytes = Number(uploader.totalBytes) || 0;
@@ -2666,6 +2725,15 @@ const CloudRecorder = () => {
       });
       let sentBytes = 0;
       for (const step of plan.plan) {
+        if (gapResendAbortRef.current) {
+          void emitUploadTelemetry("upload_gap_resend_aborted", {
+            trackType: track,
+            reason: `budget-expired-after-${sentBytes}-of-${plan.gapBytes}`,
+            sentBytes,
+            gapBytes: plan.gapBytes,
+          });
+          return;
+        }
         const entry = await store.getItem(`${keyPrefix}${step.index}`);
         if (!entry?.chunk) {
           // Stopping here is safe: everything sent so far was contiguous from
@@ -2748,18 +2816,7 @@ const CloudRecorder = () => {
 
   // The session-wide stall check below ORs the tracks together, so a healthy
   // screen masks a camera frozen at its first byte.
-  const TRACK_STALL_MS = 30000;
-  // mediabunny's fMP4 ftyp is 28 bytes and lands before any encoded packet, so
-  // an offset this low means the muxer opened and no fragment ever closed.
-  const INIT_ONLY_OFFSET = 64;
-
-  // ts null, not 0: a falsy check would read a legitimate epoch-0 stamp as
-  // "no baseline yet" and never flag the track.
-  const trackStallState = useRef({
-    screen: { offset: -1, ts: null, notified: false },
-    camera: { offset: -1, ts: null, notified: false },
-    audio: { offset: -1, ts: null, notified: false },
-  });
+  const trackStallState = useRef(createTrackStallState());
 
   const uploaderFailureCounters = {
     screen: consecutiveScreenFailures,
@@ -2773,47 +2830,29 @@ const CloudRecorder = () => {
       camera: cameraUploader.current,
       audio: audioUploader.current,
     };
-    const state = trackStallState.current;
-    let anyAdvanced = false;
+    const stalls = sweepTrackStalls({
+      state: trackStallState.current,
+      uploaders,
+      now,
+    });
+    // Proves the sweep ran at all. upload_track_stalled has never fired in
+    // prod, and a silent detector and a healthy fleet look identical.
+    trackSweepTicks.current += 1;
 
-    for (const [track, uploader] of Object.entries(uploaders)) {
-      const entry = state[track];
-      if (!uploader) {
-        entry.offset = -1;
-        continue;
-      }
-      const offset = Number(uploader.offset) || 0;
-      if (offset !== entry.offset) {
-        entry.offset = offset;
-        entry.ts = now;
-        entry.notified = false;
-        anyAdvanced = true;
-      }
-    }
-
-    for (const [track, uploader] of Object.entries(uploaders)) {
-      const entry = state[track];
-      if (!uploader || entry.ts === null || entry.notified) continue;
-      if (now - entry.ts <= TRACK_STALL_MS) continue;
-      if (uploader.status === "completed" || uploader.status === "aborted") {
-        continue;
-      }
-      entry.notified = true;
-      // The signature from the churned-user report: one track pinned at its
-      // init segment while another uploads normally.
-      const stuckAtInit = entry.offset > 0 && entry.offset <= INIT_ONLY_OFFSET;
+    for (const stall of stalls) {
+      const { track, uploader } = stall;
       void emitUploadTelemetry("upload_track_stalled", {
         trackType: track,
         // The mapping reads `offset`, not `offsetBytes`.
-        offset: entry.offset,
-        reason: `${stuckAtInit ? "stuck-at-init" : "stalled"}-${track}${
-          anyAdvanced ? "-sibling-progressing" : ""
+        offset: stall.offset,
+        reason: `${stall.stuckAtInit ? "stuck-at-init" : "stalled"}-${track}${
+          stall.siblingProgressing ? "-sibling-progressing" : ""
         }`,
         totalBytes: Number(uploader.totalBytes) || 0,
         queuedBytes: Number(uploader.queuedBytes) || 0,
-        stallMs: now - entry.ts,
-        stuckAtInit,
-        siblingProgressing: anyAdvanced,
+        stallMs: stall.stallMs,
+        stuckAtInit: stall.stuckAtInit,
+        siblingProgressing: stall.siblingProgressing,
         uploaderStatus: uploader.status || null,
         errorCode: uploader.lastErrorCode || null,
         isPaused: Boolean(uploader.isPaused),
@@ -3407,6 +3446,21 @@ const CloudRecorder = () => {
           : null;
     uploader?.updateEncoderInfo?.({ codec: actual });
     persistSessionState({});
+  };
+
+  // The TUS filetype is fixed at uploader init, which runs before encoder
+  // selection. A flip here leaves Bunny's label wrong, so record the truth.
+  const syncSelectedContainer = (track, uploaderRef, container) => {
+    const uploader = uploaderRef?.current;
+    if (!uploader || !container) return;
+    const declared = uploader.container || null;
+    uploader.updateEncoderInfo?.({ container });
+    if (declared && declared !== container) {
+      void emitUploadTelemetry("upload_container_mismatch", {
+        trackType: track,
+        reason: `declared-${declared}-actual-${container}`,
+      });
+    }
   };
 
   const checkMaxMemory = () => {
@@ -4515,6 +4569,9 @@ const CloudRecorder = () => {
   };
 
   const startRecording = async () => {
+    // The BG start-fail re-check tears the recorder down after 2.5s unless a
+    // stage lands. The free recorders mark, this one never did.
+    markStartProgress("preflight-enter");
     setInitProject(false);
     await clearLocalScreenPlaybackOffer("start-recording");
     startTabKeepAlive();
@@ -4527,6 +4584,7 @@ const CloudRecorder = () => {
     if (!storageReady) return;
     await ensureAudioChunkStoreReady();
     await ensureCameraChunkStoreReady();
+    markStartProgress("stores-ready");
 
     if (!uploadersInitialized.current) {
       sendRecordingError(
@@ -4651,12 +4709,14 @@ const CloudRecorder = () => {
     }
 
     if (!recorderSession.current) {
+      markStartProgress("session-register");
       const registered = await startRecorderSession({
         projectId,
         sessionId: ensureRecordingSessionId(),
       });
       if (!registered) return;
     }
+    markStartProgress("session-ready");
 
     await Promise.allSettled([
       screenUploader.current?.setSessionId?.(recorderSession.current?.id || null),
@@ -4671,9 +4731,11 @@ const CloudRecorder = () => {
     }
 
     try {
+      markStartProgress("stores-clear");
       await chunksStore.clear();
       await clearAudioChunkStore("start-recording");
       await clearCameraChunkStore("start-recording");
+      markStartProgress("stores-cleared");
     } catch (err) {
       fatalErrorRef.current = true;
       sendRecordingError(
@@ -4856,6 +4918,7 @@ const CloudRecorder = () => {
         };
 
         const screenSettings = screenTrack?.getSettings?.() || {};
+        markStartProgress("encoder-probe");
         const screenSelection = await chooseTrackEncoder({
           track: "screen",
           stream,
@@ -5014,6 +5077,7 @@ const CloudRecorder = () => {
             framerate: Number(screenSettings.frameRate) || 30,
           },
         });
+        markStartProgress("encoder-probe-done");
         screenRecorder.current = screenSelection.recorder;
         // Only WebCodecsTrackRecorder disposes the prewarm. On the
         // MediaRecorder fallback nothing would, leaving a configured hardware
@@ -5029,6 +5093,7 @@ const CloudRecorder = () => {
         encoderKinds.screen = screenSelection.kind;
         trackContainers.screen = screenSelection.container;
         trackCodecs.screen = screenSelection.codec;
+        syncSelectedContainer("screen", screenUploader, screenSelection.container);
         encoderHwSlots = screenSelection.hwSlots || encoderHwSlots;
         logDebugEvent("encoder-selected", {
           track: "screen",
@@ -5063,6 +5128,7 @@ const CloudRecorder = () => {
           audioBitsPerSecond: 128000,
         };
 
+        markStartProgress("audio-encoder-probe");
         const audioSelection = await chooseTrackEncoder({
           track: "audio",
           stream: rawMicStream.current,
@@ -5176,10 +5242,12 @@ const CloudRecorder = () => {
             }
           },
         });
+        markStartProgress("audio-encoder-probe-done");
         audioRecorder.current = audioSelection.recorder;
         encoderKinds.audio = audioSelection.kind;
         trackContainers.audio = audioSelection.container;
         trackCodecs.audio = audioSelection.codec;
+        syncSelectedContainer("audio", audioUploader, audioSelection.container);
         logDebugEvent("encoder-selected", {
           track: "audio",
           kind: audioSelection.kind,
@@ -5213,19 +5281,29 @@ const CloudRecorder = () => {
           streamToRecord = new MediaStream(cameraStream.current.getVideoTracks());
         }
 
+        const cameraSettings = cameraTrack?.getSettings?.() || {};
+
         const cameraOptions = {
           mimeType:
             recordingType.current === "camera"
               ? "video/webm;codecs=vp9,opus"
               : "video/webm;codecs=vp9",
-          videoBitsPerSecond: 16000000,
+          // Priced on the encoded size: WebCodecs resizes a 4K webcam to the
+          // 1080p cap first. The MediaRecorder fallback takes no bitrate at all.
+          videoBitsPerSecond: computeCameraBitrate(
+            computeEncodedDimensions({
+              width: Number(cameraSettings.width),
+              height: Number(cameraSettings.height),
+            }),
+          ),
           audioBitsPerSecond: 128000,
         };
-
-        const cameraSettings = cameraTrack?.getSettings?.() || {};
         const cameraHasAudio =
           recordingType.current === "camera" &&
           (streamToRecord?.getAudioTracks?.()?.length ?? 0) > 0;
+        // probeConcurrentHw runs here, and its flush race alone is capped at
+        // 2.5s, the same window the BG teardown uses.
+        markStartProgress("camera-encoder-probe");
         const cameraSelection = await chooseTrackEncoder({
           track: "camera",
           stream: streamToRecord,
@@ -5337,10 +5415,12 @@ const CloudRecorder = () => {
             }
           },
         });
+        markStartProgress("camera-encoder-probe-done");
         cameraRecorder.current = cameraSelection.recorder;
         encoderKinds.camera = cameraSelection.kind;
         trackContainers.camera = cameraSelection.container;
         trackCodecs.camera = cameraSelection.codec;
+        syncSelectedContainer("camera", cameraUploader, cameraSelection.container);
         encoderHwSlots = cameraSelection.hwSlots || encoderHwSlots;
         logDebugEvent("encoder-selected", {
           track: "camera",
@@ -6463,6 +6543,10 @@ const CloudRecorder = () => {
     // Close any server/client byte gap before declaring a length. A track whose
     // PATCHes 2xx'd without landing still has its bytes on disk.
     if (GAP_RESEND_ENABLED) {
+      gapResendAbortRef.current = false;
+      const budgetTimer = setTimeout(() => {
+        gapResendAbortRef.current = true;
+      }, GAP_RESEND_BUDGET_MS);
       await Promise.race([
         Promise.allSettled([
           resendUploadGap("screen", screenUploader, chunksStore, "chunk_", screenChunkByteRangesRef),
@@ -6471,6 +6555,9 @@ const CloudRecorder = () => {
         ]),
         new Promise((r) => setTimeout(r, GAP_RESEND_BUDGET_MS)),
       ]);
+      // Stops stragglers at their next step, before finalize declares a length.
+      gapResendAbortRef.current = true;
+      clearTimeout(budgetTimer);
     }
 
     const finalizeCalls = [
