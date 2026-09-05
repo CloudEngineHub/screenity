@@ -4042,6 +4042,14 @@ const Recorder = () => {
               const hasMic = !!helperAudioStream.current?.getAudioTracks?.()
                 ?.length;
               const hasSystemAudio = sysTracks.length > 0 && data.systemAudio;
+              // A track keeps reporting length after it ends, so hasMic alone
+              // can't separate a muted device from a dead one.
+              const trackState = (t) =>
+                t ? { readyState: t.readyState, muted: t.muted, enabled: t.enabled } : null;
+              const micTrackState = trackState(
+                helperAudioStream.current?.getAudioTracks?.()[0],
+              );
+              const sysTrackState = trackState(sysTracks[0]);
               try {
                 chrome.runtime.sendMessage({
                   type: "diag-forward",
@@ -4052,6 +4060,8 @@ const Recorder = () => {
                       : null,
                     hasMic,
                     hasSystemAudio,
+                    micTrackState,
+                    sysTrackState,
                     audioContextState: aCtx.current?.state ?? null,
                     docVisibility:
                       typeof document !== "undefined"

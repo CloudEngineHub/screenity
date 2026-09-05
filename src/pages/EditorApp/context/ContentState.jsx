@@ -389,14 +389,33 @@ const ContentState = (props) => {
     // mirror to storage so BG's deferred endDiagSession watcher sees ready
     // without the diag session being open
     try {
-      chrome.storage.local.set({
-        editorReadyAt: Date.now(),
-        editorReadyPath: path,
-        // clear so a bundle grabbed after recovery doesn't report a resolved
-        // attempt's errCode as the live failure
-        lastRecordingError: null,
-        editorRecordingError: null,
-      });
+      // Clearing the live keys outright made a zip exported from the editor
+      // report no error at all, so the values move aside instead.
+      chrome.storage.local.get(
+        ["lastRecordingError", "editorRecordingError"],
+        (prev) => {
+         try {
+          const carried =
+            prev?.lastRecordingError || prev?.editorRecordingError
+              ? {
+                  at: Date.now(),
+                  lastRecordingError: prev?.lastRecordingError ?? null,
+                  editorRecordingError: prev?.editorRecordingError ?? null,
+                }
+              : null;
+          const patch = {
+            editorReadyAt: Date.now(),
+            editorReadyPath: path,
+            lastRecordingError: null,
+            editorRecordingError: null,
+          };
+          // Written even when there is nothing to carry; left alone, a stale
+          // error rides in getErrorSnapshot forever.
+          patch.resolvedRecordingError = carried;
+          chrome.storage.local.set(patch);
+         } catch {}
+        },
+      );
     } catch {}
   }, [contentState.ready]);
 

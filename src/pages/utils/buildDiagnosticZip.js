@@ -101,6 +101,40 @@ const readBrowserVersionDetail = async () => {
   }
 };
 
+// A full disk fails every storage.set and OPFS write silently (those call
+// sites swallow), so probe a real write as well as the quota.
+const readStorageHealth = async () => {
+  const out = { quotaBytes: null, usageBytes: null, writeOk: null };
+  try {
+    const est = await navigator.storage?.estimate?.();
+    if (est) {
+      out.quotaBytes = est.quota ?? null;
+      out.usageBytes = est.usage ?? null;
+    }
+  } catch {}
+  try {
+    const probe = `diag-write-probe-${Date.now()}`;
+    await chrome.storage.local.set({ diagWriteProbe: probe });
+    const back = await chrome.storage.local.get(["diagWriteProbe"]);
+    out.writeOk = back?.diagWriteProbe === probe;
+    await chrome.storage.local.remove(["diagWriteProbe"]);
+  } catch {
+    out.writeOk = false;
+  }
+  return out;
+};
+
+// Enough to tell whether this profile has ever recorded, and how.
+const LAST_RECORDING_KEYS = [
+  "lastRecordingType",
+  "lastRecordingBackendRef",
+  "lastRecorderStopReason",
+  "lastRecorderStopAt",
+  "editorReadyAt",
+  "editorReadyPath",
+  "extensionInstalledAt",
+];
+
 export const buildDiagnosticZip = async ({
   extraConfig = {},
   source = "unknown",
@@ -114,6 +148,8 @@ export const buildDiagnosticZip = async ({
     lifecycleData,
     perfTimeline,
     uploadTelemetry,
+    storageHealth,
+    lastRecording,
   ] = await Promise.all([
       chrome.runtime.sendMessage({ type: "get-platform-info" }),
       chrome.runtime.sendMessage({ type: "get-diagnostic-log" }),
@@ -148,6 +184,10 @@ export const buildDiagnosticZip = async ({
           ),
         ),
       ),
+      readStorageHealth(),
+      new Promise((resolve) =>
+        chrome.storage.local.get(LAST_RECORDING_KEYS, resolve),
+      ),
     ]);
 
   const manifestVersion = chrome.runtime.getManifest().version;
@@ -174,6 +214,7 @@ export const buildDiagnosticZip = async ({
       devicePixelRatio: window.devicePixelRatio,
     },
     deviceMemory: navigator.deviceMemory || null,
+    storage: storageHealth,
     // Tells a localhost dev build apart from a store build when a report says
     // an API call just failed to fetch.
     apiBase: process.env.SCREENITY_API_BASE_URL || null,
@@ -181,6 +222,7 @@ export const buildDiagnosticZip = async ({
 
   files["config.json"] = JSON.stringify({
     fastRecorder: fastRecorderData,
+    lastRecording,
     ...extraConfig,
   });
 

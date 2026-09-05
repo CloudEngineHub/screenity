@@ -91,8 +91,22 @@ const Waveform = () => {
     }
 
     function startAudioCapture() {
-      navigator.mediaDevices
-        .getUserMedia({ audio: true, video: false })
+      // Bare {audio:true} metered whichever mic Chrome picks, showing a healthy
+      // level for a device the recorder was not using.
+      chrome.storage.local
+        .get(["defaultAudioInput"])
+        .then(({ defaultAudioInput }) => {
+          const id =
+            defaultAudioInput && defaultAudioInput !== "none"
+              ? defaultAudioInput
+              : null;
+          // Not `exact`: a stale id (an unplugged Continuity mic) would throw
+          // and leave a dead meter, which reads as "mic broken".
+          return navigator.mediaDevices.getUserMedia({
+            audio: id ? { deviceId: { ideal: id } } : true,
+            video: false,
+          });
+        })
         .then((stream) => {
           audioStream = stream;
           initializeAudioContext();

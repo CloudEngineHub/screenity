@@ -27,6 +27,9 @@ const MP4_MR_VIDEO_ONLY = "video/mp4;codecs=avc1.42E01E";
 // AAC-LC, audio-only. Pinned: a bare audio/mp4 records Opus-in-MP4 on
 // Chrome 151.
 const MP4_MR_AUDIO_ONLY = "audio/mp4;codecs=mp4a.40.2";
+// Separated mics go to Bunny Storage, whose audio MIME allowlist takes
+// audio/webm and rejects video/webm.
+const WEBM_MR_AUDIO_ONLY = "audio/webm;codecs=opus";
 
 const mimeSupported = (mime) => {
   try {
@@ -82,6 +85,7 @@ const mediaRecorderVideoPlan = () => {
 // Null for WebM: callers pass their existing mime through unchanged.
 export const mediaRecorderMimeFor = ({ container, enableAudio }) => {
   if (container === "audio/mp4") return MP4_MR_AUDIO_ONLY;
+  if (container === "audio/webm") return WEBM_MR_AUDIO_ONLY;
   if (container !== "video/mp4") return null;
   return enableAudio ? MP4_MR_WITH_AUDIO : MP4_MR_VIDEO_ONLY;
 };
@@ -178,19 +182,37 @@ const TRACK_TO_PROBE = {
 // BunnyTusUploader's TUS Upload-Metadata `filetype` can be set to the
 // container the upcoming recorder will produce. Both inspectTrackPlan
 // and chooseTrackEncoder hit the same probe cache, so they always agree.
-export const inspectTrackPlan = async ({ track, probeOptions, stream = null }) => {
+export const inspectTrackPlan = async ({
+  track,
+  probeOptions,
+  stream = null,
+  separated = false,
+}) => {
   // Audio never uses WebCodecs: screen + camera already contend for the
   // H.264 slots. MP4 here is a muxer swap inside MediaRecorder, not an encoder.
   if (track === "audio") {
     const mp4 = probeMp4AudioMediaRecorder(stream);
+    // Storage's audio MIME allowlist rejects video/webm and discards the take
+    // with no user-facing error, so a separated mic reaches it only on a build
+    // supporting neither audio container.
+    const webmContainer = !separated
+      ? // Muxed tracks have always uploaded under video/webm.
+        "video/webm"
+      : mimeSupported(WEBM_MR_AUDIO_ONLY)
+      ? "audio/webm"
+      : mimeSupported(MP4_MR_AUDIO_ONLY)
+      ? "audio/mp4"
+      : "video/webm";
     return {
       kind: "mediarecorder",
-      // WebM fallback keeps reporting video/webm, the filetype these
-      // tracks have always uploaded under.
-      container: mp4 ? "audio/mp4" : "video/webm",
+      container: mp4 ? "audio/mp4" : webmContainer,
       codec: mp4 ? "mp4a.40.2" : "opus",
       hwSlots: null,
-      reason: mp4 ? "audio-track-mp4" : "audio-track-webm",
+      reason: mp4
+        ? "audio-track-mp4"
+        : webmContainer === "audio/webm"
+        ? "audio-track-audio-webm"
+        : "audio-track-webm",
     };
   }
   const [hwSlots, sticky] = await ensureProbes(probeOptions || {});
@@ -262,6 +284,7 @@ export const inspectTrackPlan = async ({ track, probeOptions, stream = null }) =
 export const chooseTrackEncoder = async ({
   track,
   stream,
+  separated = false,
   mimeType,
   videoBitsPerSecond,
   audioBitsPerSecond,
@@ -271,7 +294,7 @@ export const chooseTrackEncoder = async ({
   onDataAvailable,
   probeOptions,
 }) => {
-  const plan = await inspectTrackPlan({ track, probeOptions, stream });
+  const plan = await inspectTrackPlan({ track, probeOptions, stream, separated });
 
   if (plan.kind === "mediarecorder") {
     // Use the plan's mime so bytes match the container we already reported (TUS
@@ -284,8 +307,11 @@ export const chooseTrackEncoder = async ({
     // start(). Probe the real stream and fall back to WebM rather than lose the
     // recording; plan.container follows so the reported filetype stays truthful.
     if (planMime && !canStartMp4Recorder(stream, planMime)) {
-      planMime = null;
-      plan.container = "video/webm";
+      // A separated mic can't fall back to video/webm; Storage would reject it.
+      const audioWebm =
+        track === "audio" && separated && mimeSupported(WEBM_MR_AUDIO_ONLY);
+      planMime = audioWebm ? WEBM_MR_AUDIO_ONLY : null;
+      plan.container = audioWebm ? "audio/webm" : "video/webm";
       plan.codec = track === "audio" ? "opus" : "vp9";
       plan.reason = `${plan.reason}+mp4-start-probe-failed`;
     }

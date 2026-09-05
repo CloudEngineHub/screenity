@@ -222,6 +222,9 @@ export const getErrorSnapshot = async () => {
     "lastTrackEndEvent",
     "lastTrackEndedEvent",
     "lastSubscriptionLoss",
+    // Preserved by the editor when it clears the live error keys on ready,
+    // so a zip exported from the editor still carries the failure.
+    "resolvedRecordingError",
   ];
   try {
     return await chrome.storage.local.get(keys);

@@ -5,6 +5,7 @@ import {
   messageDispatcher,
 } from "../../messaging/messageRouter";
 import { hydrateDiagnosticLog, diagEvent } from "../utils/diagnosticLog";
+import { runMicRecoveryScan } from "../CloudRecorder/micRecovery";
 import { initCountdownFallback } from "./recording/countdownFallback";
 import { initKeepAwake } from "./recording/keepAwake";
 import { initLifecycleObserver } from "./lifecycleObserver";
@@ -309,6 +310,11 @@ const cleanupOrphanOpfsSessions = async () => {
       if (!key.startsWith("uploadJournal-")) continue;
       if (value?.sessionId) liveIds.add(value.sessionId);
     }
+    // The mic recovery scan is deferred; without this its chunks are reaped
+    // seconds before it goes looking for them.
+    for (const debt of Object.values(all.pendingMicRecovery || {})) {
+      if (debt?.sessionId) liveIds.add(debt.sessionId);
+    }
 
     const orphans = dirs.filter((id) => !liveIds.has(id));
     if (!orphans.length) return;
@@ -341,6 +347,12 @@ initUninstallSurvey();
 (async () => {
   await clearStaleLocks();
   await recoverInFlightRecording();
+  // A separated take's voice is only in its mic file, so a tab that died during
+  // the post-stop upload left the scene without it. Deferred so it doesn't
+  // compete with recovery for the network on a cold start.
+  setTimeout(() => {
+    runMicRecoveryScan().catch(() => {});
+  }, 8000);
 })();
 cleanupOrphanOpfsSessions();
 

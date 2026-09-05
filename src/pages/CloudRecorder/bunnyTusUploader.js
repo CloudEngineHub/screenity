@@ -1264,7 +1264,9 @@ export default class BunnyTusUploader {
   }
 
   async write(chunk) {
-    if (this.isFinalizing) {
+    // isFinalizing no longer stays latched after success, so completed is the
+    // only thing left saying the upload is closed.
+    if (this.isFinalizing || this.status === "completed") {
       this.bytesLostAfterFinalize += chunk?.size || 0;
       this.setUploaderError("write-after-finalize");
       throw new Error("Cannot write during finalization");
@@ -1513,7 +1515,7 @@ export default class BunnyTusUploader {
             console.warn(
               "[bunnyTusUploader] 401 mid-PATCH; refreshing TUS auth + retrying once",
             );
-            // Same event name as app-web so one query spans both clients.
+            // Event name is shared with the web client so one query spans both.
             // trigger separates "Bunny rejected us" from "we resumed".
             this.emitTelemetry("upload_auth_refreshed_midupload", {
               reason: "auth-refresh-http-401",
@@ -1864,6 +1866,10 @@ export default class BunnyTusUploader {
   }
 
   async finalize() {
+    // Re-running drops status back to "finalizing", re-issues the Upload-Length
+    // PATCH and double-emits completion; a non-410 there fails a recording that
+    // uploaded fine. Bytes lost after finalize still fall through to a failure.
+    if (this.status === "completed" && this.bytesLostAfterFinalize === 0) return;
     if (this.isFinalizing) throw new Error("Already finalizing");
     this.isFinalizing = true;
     this.status = "finalizing";
@@ -2029,16 +2035,17 @@ export default class BunnyTusUploader {
       await this.clearUploadJournal();
       this.notifyStateChange("finalize-completed");
     } catch (err) {
-      // Reset the lock so retries can attempt finalize again. Without
-      // this, every retry immediately throws "Already finalizing".
-      this.isFinalizing = false;
-      console.warn("[BunnyTusUploader] finalize failed, isFinalizing reset for retry", {
+      console.warn("[BunnyTusUploader] finalize failed", {
         trackType: this.trackType,
         error: err?.message || String(err),
         offset: this.offset,
         totalBytes: this.totalBytes,
       });
       throw err;
+    } finally {
+      // Success used to leave this latched, so a second caller (stop after an
+      // auto-finalize) threw and failed a recording that had uploaded fine.
+      this.isFinalizing = false;
     }
   }
 

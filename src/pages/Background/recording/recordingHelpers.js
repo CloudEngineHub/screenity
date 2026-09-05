@@ -332,6 +332,14 @@ const pushStreamingData = async (dataStr) => {
 export const handleGetStreamingData = async () => {
   perfMark("BG.handleGetStreamingData.enter");
   const data = await getStreamingData();
+  // micActive decides whether a mic stream, and so a separated audio recorder,
+  // exists at all; it was only observable from the offscreen document's console.
+  console.warn("[Screenity][BG] streaming-data mic", {
+    micActive: data?.micActive,
+    defaultAudioInput: data?.defaultAudioInput || null,
+    systemAudio: data?.systemAudio,
+    recordingType: data?.recordingType || null,
+  });
   const dataStr = JSON.stringify(data);
   // Fire-and-forget push (SW-initiated openRecorderTab path). Not awaited:
   // a `get-streaming-data` pull must get its response immediately, not
