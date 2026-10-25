@@ -128,6 +128,7 @@ const AudioUI = (props) => {
                   setContentState((prevContentState) => ({
                     ...prevContentState,
                     blob: prevBlob.current,
+                    pendingAudio: null,
                   }));
                   inputRef.current.value = null;
                 }}

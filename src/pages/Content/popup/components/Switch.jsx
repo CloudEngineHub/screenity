@@ -62,10 +62,7 @@ const Switch = (props) => {
 
   useEffect(() => {
     if (props.name === "hideUI") {
-      if (contentState.hideUIAlerts) {
-        setHideToolbarLabel(chrome.i18n.getMessage("hideUIAlerts"));
-        setHideToolbarState(2);
-      } else if (contentState.hideToolbar) {
+      if (contentState.hideToolbar) {
         setHideToolbarLabel(chrome.i18n.getMessage("hideToolbarLabel"));
         setHideToolbarState(1);
       } else if (contentState.toolbarHover) {
@@ -108,12 +105,10 @@ const Switch = (props) => {
                     setContentState((prevContentState) => ({
                       ...prevContentState,
                       hideToolbar: true,
-                      hideUIAlerts: false,
                       toolbarHover: false,
                     }));
                     chrome.storage.local.set({
                       hideToolbar: true,
-                      hideUIAlerts: false,
                       toolbarHover: false,
                     });
                     setHideToolbarLabel(
@@ -131,33 +126,10 @@ const Switch = (props) => {
                     setContentState((prevContentState) => ({
                       ...prevContentState,
                       hideToolbar: false,
-                      hideUIAlerts: true,
-                      toolbarHover: false,
-                    }));
-                    chrome.storage.local.set({
-                      hideToolbar: false,
-                      hideUIAlerts: true,
-                      toolbarHover: false,
-                    });
-                    setHideToolbarLabel(chrome.i18n.getMessage("hideUIAlerts"));
-                    dropdownRef.current.classList.remove("labelDropdownActive");
-                    setHideToolbarState(2);
-                  }}
-                >
-                  {chrome.i18n.getMessage("hideUIAlerts")}
-                </div>
-                <div
-                  className="labelDropdownContentItem"
-                  onClick={() => {
-                    setContentState((prevContentState) => ({
-                      ...prevContentState,
-                      hideToolbar: false,
-                      hideUIAlerts: false,
                       toolbarHover: true,
                     }));
                     chrome.storage.local.set({
                       hideToolbar: false,
-                      hideUIAlerts: false,
                       toolbarHover: true,
                     });
                     setHideToolbarLabel(
@@ -205,36 +177,20 @@ const Switch = (props) => {
                   setContentState((prevContentState) => ({
                     ...prevContentState,
                     hideToolbar: true,
-                    hideUIAlerts: false,
                     toolbarHover: false,
                   }));
                   chrome.storage.local.set({
                     hideToolbar: true,
-                    hideUIAlerts: false,
-                    toolbarHover: false,
-                  });
-                } else if (hideToolbarState === 2) {
-                  setContentState((prevContentState) => ({
-                    ...prevContentState,
-                    hideToolbar: false,
-                    hideUIAlerts: true,
-                    toolbarHover: false,
-                  }));
-                  chrome.storage.local.set({
-                    hideToolbar: false,
-                    hideUIAlerts: true,
                     toolbarHover: false,
                   });
                 } else if (hideToolbarState === 3) {
                   setContentState((prevContentState) => ({
                     ...prevContentState,
                     hideToolbar: false,
-                    hideUIAlerts: false,
                     toolbarHover: true,
                   }));
                   chrome.storage.local.set({
                     hideToolbar: false,
-                    hideUIAlerts: false,
                     toolbarHover: true,
                   });
                 }

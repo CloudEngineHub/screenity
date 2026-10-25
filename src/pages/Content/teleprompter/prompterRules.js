@@ -104,6 +104,11 @@ export const wantsCameraLayerAtStart = ({
   return (recordingType === "region" || recordingType === "tab") && own;
 };
 
+// The floating window belongs to the tab that opened it, so every other tab
+// sees only this storage flag. Its page bubble would double the camera there.
+export const cameraPipOnOtherTab = ({ ownerTabId, tabId }) =>
+  ownerTabId != null && ownerTabId !== tabId;
+
 // Whether the capture records the floating window along with the screen. A
 // region or tab capture still reports displaySurface "monitor", so the
 // recording type leads.
@@ -132,7 +137,6 @@ export const planCameraAtSurface = ({
   recordingType,
   surface,
   layers,
-  keepVisible,
   cameraEnabled,
   windowOpen,
 }) => {
@@ -146,8 +150,9 @@ export const planCameraAtSurface = ({
   if (layers.camera) return keeps ? "keep" : "close";
   if (!keeps || !cameraEnabled || !windowOpen) return "keep";
   const own = cameraCanLiveInWindow({ cloud, subscribed, instantMode });
-  // A script kept over a full-screen capture does not share the window with a burnt-in camera.
-  if (!own && layers.prompter && keepVisible) return "keep";
+  // A burnt-in camera never shares the window with the script. While the script
+  // is up, the start gate or take-start close decides which one keeps the window.
+  if (!own && layers.prompter) return "keep";
   return "open";
 };
 

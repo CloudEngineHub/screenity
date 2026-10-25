@@ -1,6 +1,7 @@
 import React, { useContext } from "react";
 import styles from "../../styles/edit/_EditorNav.module.scss";
 import { ContentStateContext } from "../../context/ContentState";
+import DisabledTip from "../../components/global/DisabledTip";
 
 const URL = "/assets/";
 
@@ -41,24 +42,29 @@ const AudioNav = () => {
     );
   };
 
+  const saveBlocked = !contentState.pendingAudio && !contentState.isFfmpegRunning;
+
   const saveChanges = async () => {
     const { pendingAudio, volume } = contentState;
-    const source = contentState.blob;
+    if (!pendingAudio || contentState.isFfmpegRunning) return;
 
-    setContentState((prev) => ({
-      ...prev,
-      isFfmpegRunning: true,
-      processingProgress: 0,
-      fromAudio: true,
-    }));
+    setContentState((prev) => ({ ...prev, fromAudio: true }));
 
-    if (pendingAudio) {
-      contentState.addAudio(source, pendingAudio, volume);
-    } else {
-      contentState.handleReencode(true);
+    const started = await contentState.addAudio(
+      contentState.blob,
+      pendingAudio,
+      volume,
+    );
+    if (!started) {
+      setContentState((prev) => ({ ...prev, fromAudio: false }));
+      return;
     }
 
-    await contentState.waitForUpdatedBlob?.();
+    const saved = await contentState.waitForUpdatedBlob?.();
+    if (!saved) {
+      setContentState((prev) => ({ ...prev, fromAudio: false }));
+      return;
+    }
 
     contentState.clearBackup();
     contentState.openToast?.(
@@ -100,27 +106,32 @@ const AudioNav = () => {
             {chrome.i18n.getMessage("sandboxEditorRevertButton")}
           </button>
 
-          <button
-            className="button primaryButton"
-            onClick={saveChanges}
-            disabled={contentState.isFfmpegRunning}
+          <DisabledTip
+            active={saveBlocked}
+            content={chrome.i18n.getMessage("sandboxEditorAudioPendingHint")}
           >
-            {contentState.isFfmpegRunning ? (
-              contentState.processingProgress > 0 ? (
-                <>
-                  {chrome.i18n.getMessage("sandboxEditorSaveProgressButton") ||
-                    "Saving"}{" "}
-                  {Math.round(contentState.processingProgress)}%
-                </>
+            <button
+              className="button primaryButton"
+              onClick={saveChanges}
+              disabled={contentState.isFfmpegRunning || !contentState.pendingAudio}
+            >
+              {contentState.isFfmpegRunning ? (
+                contentState.processingProgress > 0 ? (
+                  <>
+                    {chrome.i18n.getMessage("sandboxEditorSaveProgressButton") ||
+                      "Saving"}{" "}
+                    {Math.round(contentState.processingProgress)}%
+                  </>
+                ) : (
+                  chrome.i18n.getMessage("sandboxEditorSaveProgressButton") ||
+                  "Saving..."
+                )
               ) : (
-                chrome.i18n.getMessage("sandboxEditorSaveProgressButton") ||
-                "Saving..."
-              )
-            ) : (
-              chrome.i18n.getMessage("sandboxEditorSaveButton") ||
-              "Save changes"
-            )}
-          </button>
+                chrome.i18n.getMessage("sandboxEditorSaveButton") ||
+                "Save changes"
+              )}
+            </button>
+          </DisabledTip>
         </div>
       </div>
     </div>

@@ -18,6 +18,8 @@ const Trimmer = (props) => {
   const addToHistoryRef = useRef(null);
   const startBoundRef = useRef(0);
   const endBoundRef = useRef(1);
+  const lastSeekRef = useRef(0);
+  const seekTimerRef = useRef(null);
 
   useEffect(() => {
     setContentStateRef.current = setContentState;
@@ -25,6 +27,33 @@ const Trimmer = (props) => {
     startBoundRef.current = contentState.start;
     endBoundRef.current = contentState.end;
   });
+
+  const seekToHandle = (handle) => {
+    setContentStateRef.current((prev) =>
+      handle && prev.duration > 0
+        ? {
+            ...prev,
+            time: prev[handle] * prev.duration,
+            updatePlayerTime: true,
+          }
+        : prev,
+    );
+  };
+
+  // Leading + trailing throttle so a fast drag still lands on the last frame.
+  const scheduleSeek = (handle) => {
+    const elapsed = performance.now() - lastSeekRef.current;
+    clearTimeout(seekTimerRef.current);
+    if (elapsed >= 60) {
+      lastSeekRef.current = performance.now();
+      seekToHandle(handle);
+    } else {
+      seekTimerRef.current = setTimeout(() => {
+        lastSeekRef.current = performance.now();
+        seekToHandle(handle);
+      }, 60 - elapsed);
+    }
+  };
 
   const handleMouseMoveRef = useRef(null);
   const handleMouseUpRef = useRef(null);
@@ -57,12 +86,16 @@ const Trimmer = (props) => {
           end: Math.max(validPosition, prev.start + 0.02),
         }));
       }
+      scheduleSeek(activeHandle.current);
     };
   }
   if (!handleMouseUpRef.current) {
     handleMouseUpRef.current = () => {
+      const handle = activeHandle.current;
       isDragging.current = false;
       activeHandle.current = null;
+      clearTimeout(seekTimerRef.current);
+      seekToHandle(handle);
       try {
         addToHistoryRef.current?.();
       } catch {}
@@ -78,6 +111,7 @@ const Trimmer = (props) => {
   // Cleanup if component unmounts mid-drag.
   useEffect(() => {
     return () => {
+      clearTimeout(seekTimerRef.current);
       document.removeEventListener("mousemove", handleMouseMoveRef.current);
       document.removeEventListener("mouseup", handleMouseUpRef.current);
     };

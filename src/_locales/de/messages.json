@@ -839,10 +839,6 @@
     "message": "Mikrofon deaktiviert",
     "description": "Toast-Titel 'Mikrofon deaktiviert'"
   },
-  "hideUIAlerts": {
-    "message": "UI-Benachrichtigungen ausblenden",
-    "description": "Schaltfläche 'UI-Benachrichtigungen ausblenden'"
-  },
   "noShowAgain": {
     "message": "Nicht erneut anzeigen",
     "description": "Schaltfläche 'Nicht erneut anzeigen'"
@@ -2056,5 +2052,13 @@
   "teleprompterRegionStartOnPage": {
     "message": "Die Aufnahme eines Bereichs muss auf der Seite gestartet werden",
     "description": "Tooltip on the disabled Start button in the floating teleprompter window when recording a region, which can only be started from the page"
+  },
+  "sandboxEditorSelectionPendingHint": {
+    "message": "Wende die Auswahl zuerst mit „Zuschneiden“ oder „Schneiden“ an.",
+    "description": "Tooltip on the disabled save button while trim handles are moved but no edit has been applied"
+  },
+  "sandboxEditorAudioPendingHint": {
+    "message": "Füge zuerst eine Audiodatei hinzu, um die Änderungen zu speichern.",
+    "description": "Tooltip on the disabled save button in the audio editor until an audio file is added"
   }
 }

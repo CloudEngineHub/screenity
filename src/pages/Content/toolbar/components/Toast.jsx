@@ -28,8 +28,9 @@ const Toast = () => {
     contentStateRef.current = contentState;
   }, [contentState]);
 
-  const openToast = useCallback((title, action, durationMs = 2000) => {
-    if (contentStateRef.current.hideUI) return;
+  const openToast = useCallback((title, action, durationMs = 2000, opts) => {
+    // The toast is in the page, so a tab or screen capture records it.
+    if (opts?.quietWhileRecording && contentStateRef.current.recording) return;
     setTitle(title);
     setOpen(true);
     // Keep trigger callable even when a toast is opened without an action.

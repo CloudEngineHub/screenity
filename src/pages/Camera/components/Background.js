@@ -70,9 +70,11 @@ const Background = () => {
         bottomCanvasContextRef,
       );
 
+      const video = videoRef.current;
+      const hasVideoSize = video && video.videoWidth > 0 && video.videoHeight > 0;
       resizeCanvases(
-        effectRef.current.width,
-        effectRef.current.height,
+        hasVideoSize ? video.videoWidth : effectRef.current.width,
+        hasVideoSize ? video.videoHeight : effectRef.current.height,
         true,
         effectRef.current,
         canvasRef,
@@ -90,6 +92,7 @@ const Background = () => {
     let consecutiveErrors = 0;
     let lastSuccessAt = Date.now();
     let recreatingSegmenter = false;
+    let lastFrameCount = -1;
 
     // Watchdog: if the segmenter goes silent (returns null masks for
     // 5s+ while video is delivering frames), the GPU context likely
@@ -146,11 +149,23 @@ const Background = () => {
         const segmenter = segmenterRef.current;
 
         if (video && video.readyState >= 2 && segmenter && video.videoWidth > 0) {
+          // rAF outruns the camera; skip frames already drawn.
+          const frameCount = video.getVideoPlaybackQuality?.().totalVideoFrames;
+          if (frameCount !== undefined) {
+            if (frameCount === lastFrameCount) {
+              animFrameId = requestAnimationFrame(tick);
+              return;
+            }
+            lastFrameCount = frameCount;
+          }
           const result = segmentFromVideo(video, segmenter);
 
-          if (result && result.categoryMask) {
+          if (result && result.confidenceMask) {
             consecutiveErrors = 0;
             lastSuccessAt = Date.now();
+            if (bottomCanvasRef.current) {
+              bottomCanvasRef.current.style.opacity = blurRef.current ? "0" : "1";
+            }
             if (blurRef.current) {
               renderBlurFromVideo(video, result, canvasRef);
             } else if (effectRef.current) {
@@ -236,6 +251,7 @@ const Background = () => {
             transform: "translate(-50%, -50%)",
             width: "100%",
             height: "100%",
+            objectFit: "cover",
             zIndex: 999999,
             opacity: backgroundEffects ? 1 : 0,
             backgroundColor: "transparent",

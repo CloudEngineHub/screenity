@@ -839,10 +839,6 @@
     "message": "Microphone désactivé",
     "description": "Titre de l'alerte microphone désactivé"
   },
-  "hideUIAlerts": {
-    "message": "Masquer les notifications de l'interface",
-    "description": "Bouton pour masquer les alertes de l'interface"
-  },
   "noShowAgain": {
     "message": "Ne pas afficher à nouveau",
     "description": "Bouton Ne pas afficher à nouveau"
@@ -2056,5 +2052,13 @@
   "teleprompterRegionStartOnPage": {
     "message": "L'enregistrement d'une zone doit être lancé depuis la page",
     "description": "Tooltip on the disabled Start button in the floating teleprompter window when recording a region, which can only be started from the page"
+  },
+  "sandboxEditorSelectionPendingHint": {
+    "message": "Utilisez Recadrer ou Supprimer pour appliquer d'abord votre sélection.",
+    "description": "Tooltip on the disabled save button while trim handles are moved but no edit has been applied"
+  },
+  "sandboxEditorAudioPendingHint": {
+    "message": "Ajoutez d'abord un fichier audio pour enregistrer les modifications.",
+    "description": "Tooltip on the disabled save button in the audio editor until an audio file is added"
   }
 }

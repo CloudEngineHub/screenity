@@ -105,6 +105,7 @@ const ContentState = (props) => {
   const tabIdRef = useRef(null);
   const opIdRef = useRef(0);
   const editWatchdogRef = useRef(null);
+  const editWaitersRef = useRef([]);
 
   useEffect(() => {
     if (!DEBUG_RECORDER && !isRecordingDebugEnabled()) return;
@@ -889,6 +890,15 @@ const ContentState = (props) => {
           const probedSec = Number.isFinite(video.duration) && video.duration > 0
             ? video.duration
             : 0;
+          // Large gap = the file holds less than was recorded (or a wrong mvhd).
+          // Telemetry only; the override below is unchanged.
+          if (recSec - probedSec > Math.max(10, recSec * 0.15)) {
+            diagForward("editor-duration-mismatch", {
+              recordedSec: Math.round(recSec),
+              fileSec: Math.round(probedSec),
+              blobBytes: contentState.blob?.size ?? 0,
+            });
+          }
           if (recSec > probedSec + 0.3) {
             durationSec = recSec;
           } else if (probedSec > 0) {
@@ -2219,6 +2229,7 @@ const ContentState = (props) => {
       // discard timed-out/superseded ops
       const msgOpId = event.data._opId;
       if (msgOpId != null && msgOpId !== opIdRef.current) return;
+      settleEditWaiters(true);
 
       const base64 = event.data.base64;
 
@@ -2302,6 +2313,12 @@ const ContentState = (props) => {
         URL.revokeObjectURL(video.src);
         video.remove();
       };
+      video.onerror = () => {
+        // keep a stale pre-edit selection from blocking Save on the new blob
+        setContentState((prev) => ({ ...prev, start: 0, end: 1 }));
+        URL.revokeObjectURL(video.src);
+        video.remove();
+      };
 
       video.src = URL.createObjectURL(blob);
 
@@ -2378,6 +2395,7 @@ const ContentState = (props) => {
         errorStack: event.data.errorStack,
       });
       clearEditOp();
+      settleEditWaiters(false);
 
       // fall back to webm/rawBlob even if conversion fails
       setContentState((prev) => {
@@ -2403,6 +2421,7 @@ const ContentState = (props) => {
       chrome.runtime.sendMessage({ type: "recording-complete" });
     } else if (event.data.type === "audio-too-large") {
       clearEditOp();
+      settleEditWaiters(false);
       setContentState((prev) => ({
         ...prev,
         isFfmpegRunning: false,
@@ -2417,6 +2436,7 @@ const ContentState = (props) => {
     } else if (event.data.type === "edit-too-long") {
       // Too long for in-browser processing, reset so user can retry or trim.
       clearEditOp();
+      settleEditWaiters(false);
       setContentState((prev) => ({
         ...prev,
         isFfmpegRunning: false,
@@ -2631,6 +2651,7 @@ const ContentState = (props) => {
     editWatchdogRef.current = setTimeout(() => {
       editWatchdogRef.current = null;
       opIdRef.current += 1;
+      settleEditWaiters(false);
       setContentState((prev) => ({
         ...prev,
         isFfmpegRunning: false,
@@ -2646,6 +2667,12 @@ const ContentState = (props) => {
     return id;
   };
 
+  const settleEditWaiters = (ok) => {
+    const waiters = editWaitersRef.current;
+    editWaitersRef.current = [];
+    waiters.forEach((resolve) => resolve(ok));
+  };
+
   const clearEditOp = () => {
     if (editWatchdogRef.current) {
       clearTimeout(editWatchdogRef.current);
@@ -2656,6 +2683,7 @@ const ContentState = (props) => {
   const cancelEditOp = () => {
     opIdRef.current += 1;
     clearEditOp();
+    settleEditWaiters(false);
     setContentState((prev) => ({
       ...prev,
       isFfmpegRunning: false,
@@ -2669,12 +2697,14 @@ const ContentState = (props) => {
   };
 
   const addAudio = async (videoBlob, audioBlob, volume) => {
-    if (contentState.isFfmpegRunning) return;
+    if (contentState.isFfmpegRunning) return false;
     if (
       contentState.duration > contentState.editLimit &&
       !contentState.override
-    )
-      return;
+    ) {
+      setContentState((prev) => ({ ...prev, editErrorType: "too-long" }));
+      return false;
+    }
 
     const sourceBlob = videoBlob || contentState.blob || contentState.webm;
     const opId = beginEditOp();
@@ -2696,6 +2726,8 @@ const ContentState = (props) => {
       topLevel: false,
       _opId: opId,
     });
+
+    return true;
   };
 
   const handleTrim = async (cut) => {
@@ -2804,12 +2836,14 @@ const ContentState = (props) => {
   };
 
   const handleCrop = async (x, y, width, height) => {
-    if (contentState.isFfmpegRunning || contentState.cropping) return;
+    if (contentState.isFfmpegRunning || contentState.cropping) return false;
     if (
       contentState.duration > contentState.editLimit &&
       !contentState.override
-    )
-      return;
+    ) {
+      setContentState((prev) => ({ ...prev, editErrorType: "too-long" }));
+      return false;
+    }
 
     const opId = beginEditOp();
 
@@ -3833,15 +3867,10 @@ const ContentState = (props) => {
     sendMessage({ type: "load-ffmpeg" });
   };
 
+  // Resolves true once the edit's blob arrives; false on failure, timeout or cancel.
   const waitForUpdatedBlob = () => {
     return new Promise((resolve) => {
-      const handler = (event) => {
-        if (event.data?.type === "updated-blob") {
-          window.removeEventListener("message", handler);
-          resolve();
-        }
-      };
-      window.addEventListener("message", handler);
+      editWaitersRef.current.push(resolve);
     });
   };
 

@@ -8,6 +8,9 @@ export const onInstalledListener = () => {
   chrome.runtime.onInstalled.addListener(async (details) => {
     const version = chrome.runtime.getManifest().version;
 
+    // The floating window does not survive a reload, so neither does its flag.
+    chrome.storage.local.remove(["cameraPipTab", "prompterScriptTab"]).catch(() => {});
+
     if (details.reason === "install") {
       chrome.storage.local.clear();
 

@@ -55,18 +55,26 @@ const CropNav = () => {
   };
 
   const saveChanges = async () => {
-    await contentState.handleCrop(
+    setContentState((prev) => ({ ...prev, fromCropper: true }));
+
+    const started = await contentState.handleCrop(
       contentState.left,
       contentState.top,
       contentState.width,
       contentState.height
     );
+    if (!started) {
+      setContentState((prev) => ({ ...prev, fromCropper: false }));
+      return;
+    }
 
-    setContentState((prev) => ({
-      ...prev,
-      fromCropper: true,
-      hasTempChanges: false,
-    }));
+    const saved = await contentState.waitForUpdatedBlob?.();
+    if (!saved) {
+      setContentState((prev) => ({ ...prev, fromCropper: false }));
+      return;
+    }
+
+    setContentState((prev) => ({ ...prev, hasTempChanges: false }));
 
     contentState.clearBackup();
     contentState.openToast?.(

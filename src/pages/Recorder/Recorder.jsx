@@ -169,6 +169,7 @@ const Recorder = () => {
   const pendingStartAfterRestart = useRef(false);
   const recordingGeneration = useRef(0);
   const isFinishing = useRef(false);
+  const stopPromiseRef = useRef(null);
   const sentLast = useRef(false);
   const lastTimecode = useRef(0);
   const hasChunks = useRef(false);
@@ -351,6 +352,7 @@ const Recorder = () => {
 
   const lastEstimateAt = useRef(0);
   const ESTIMATE_INTERVAL_MS = 5000;
+  const ESTIMATE_TIMEOUT_MS = 5000;
   const MIN_HEADROOM = 25 * 1024 * 1024;
   // Aborting still writes a tail chunk and finalizes, so the reserve has to
   // cover the bytes in flight, not just a flat floor. No-op for WebCodecs
@@ -407,7 +409,17 @@ const Recorder = () => {
     lastEstimateAt.current = now;
 
     try {
-      const { usage = 0, quota = 0 } = await navigator.storage.estimate();
+      // A hung estimate() would freeze the serialized write chain, so bound it.
+      let estimateTimer = null;
+      const { usage = 0, quota = 0 } = await Promise.race([
+        navigator.storage.estimate(),
+        new Promise((_, reject) => {
+          estimateTimer = setTimeout(
+            () => reject(new Error("storage-estimate-timeout")),
+            ESTIMATE_TIMEOUT_MS,
+          );
+        }),
+      ]).finally(() => clearTimeout(estimateTimer));
       estimateFailed.current = false;
       const remaining = quota - usage;
       const reserve = Math.max(
@@ -435,6 +447,17 @@ const Recorder = () => {
       }
       return ok;
     } catch (err) {
+      if (String(err?.message || err).includes("storage-estimate-timeout")) {
+        // Slow, not low: keep recording and retry on the next chunk.
+        chrome.runtime
+          .sendMessage({
+            type: "diag-forward",
+            event: "recorder-storage-estimate-timeout",
+            data: { savedCount: savedCount.current },
+          })
+          .catch(() => {});
+        return !lowStorageAbort.current;
+      }
       // No quota info: caller bails ("stop recording" beats QuotaExceeded mid-write).
       debugWarn("navigator.storage.estimate() failed, treating as low-storage", err);
       estimateFailed.current = true;
@@ -1741,13 +1764,16 @@ const Recorder = () => {
     // fire-and-forget, waitForDrain only covers MediaRecorder, so onFinalized
     // could race ahead of slicing. Chain handleChunks and await in onFinalized.
     let webcodecsWriteChain = Promise.resolve();
+    let webcodecsWritesQueued = 0;
+    let webcodecsWritesAbandoned = false;
+    let webcodecsProgressDiagAt = Date.now();
 
     const handleChunk = async (data, timestampMs) => {
       if (runGeneration !== recordingGeneration.current) {
         return;
       }
       if (useWebCodecs.current) {
-        if (lowStorageAbort.current) return;
+        if (lowStorageAbort.current || webcodecsWritesAbandoned) return;
 
         // fMP4 fragments stream in (~1MB each, coalesced upstream); concatenated
         // they form a valid fMP4 playable directly in <video> and re-muxable later.
@@ -1853,9 +1879,12 @@ const Recorder = () => {
                 fileName: err.fileName,
               };
               try {
-                await chrome.storage.local.set({
-                  lastRecordingBackendRef: chunkBackendRef.current,
-                });
+                await Promise.race([
+                  chrome.storage.local.set({
+                    lastRecordingBackendRef: chunkBackendRef.current,
+                  }),
+                  new Promise((r) => setTimeout(r, 3000)),
+                ]);
               } catch {}
             }
             const toastMessage = isOpfsWriterDead
@@ -2072,9 +2101,45 @@ const Recorder = () => {
             }
             const endDrain = perfSpan("Recorder.onFinalized.waitForDrain");
             await waitForDrain();
-            try {
-              await webcodecsWriteChain;
-            } catch {}
+            // Wait for queued fragments while they keep landing; give up only after a long
+            // stall, so a recovering writer finishes the whole take.
+            {
+              let chainSettled = false;
+              webcodecsWriteChain
+                .catch(() => {})
+                .then(() => {
+                  chainSettled = true;
+                });
+              const waitStart = Date.now();
+              let lastProgressAt = waitStart;
+              let lastSaved = savedCount.current;
+              while (!chainSettled) {
+                await new Promise((r) => setTimeout(r, 100));
+                const nowMs = Date.now();
+                if (savedCount.current !== lastSaved) {
+                  lastSaved = savedCount.current;
+                  lastProgressAt = nowMs;
+                }
+                if (
+                  nowMs - lastProgressAt > 30000 ||
+                  nowMs - waitStart > 240000
+                ) {
+                  webcodecsWritesAbandoned = true;
+                  chrome.runtime
+                    .sendMessage({
+                      type: "diag-forward",
+                      event: "recorder-write-chain-stalled",
+                      data: {
+                        queued: webcodecsWritesQueued,
+                        savedCount: savedCount.current,
+                        waitedMs: nowMs - waitStart,
+                      },
+                    })
+                    .catch(() => {});
+                  break;
+                }
+              }
+            }
             endDrain();
             // Close before validating: OPFS holds an exclusive handle until close.
             if (chunkWriter.current) {
@@ -2092,6 +2157,25 @@ const Recorder = () => {
                     byteSize: closeResult?.byteSize,
                     chunkCount: closeResult?.chunkCount,
                   });
+                }
+                // All muxer bytes go through the write chain, so a shortfall means fragments were lost before disk.
+                if (
+                  typeof payload?.muxerBytes === "number" &&
+                  typeof closeResult?.byteSize === "number" &&
+                  payload.muxerBytes !== closeResult.byteSize
+                ) {
+                  chrome.runtime
+                    .sendMessage({
+                      type: "diag-forward",
+                      event: "recorder-write-shortfall",
+                      data: {
+                        muxerBytes: payload.muxerBytes,
+                        byteSize: closeResult.byteSize,
+                        queued: webcodecsWritesQueued,
+                        abandoned: webcodecsWritesAbandoned,
+                      },
+                    })
+                    .catch(() => {});
                 }
                 // Recorder's view of the finalized artifact + editor's backend.
                 // Pairs with opfs-close-ok/fail to locate header-only files.
@@ -2261,9 +2345,31 @@ const Recorder = () => {
                 timestampMs,
               });
             }
+            webcodecsWritesQueued += 1;
+            // Producer-side, so a stalled save still reports (queued climbs, saved stays flat).
+            const progressNow = Date.now();
+            // The session log keeps only 100 events: healthy takes report rarely, a backed-up queue each minute.
+            const progressEveryMs = webcodecsWritesQueued >= 5 ? 60000 : 300000;
+            if (progressNow - webcodecsProgressDiagAt >= progressEveryMs) {
+              webcodecsProgressDiagAt = progressNow;
+              chrome.runtime
+                .sendMessage({
+                  type: "diag-forward",
+                  event: "recorder-save-progress",
+                  data: {
+                    savedCount: savedCount.current,
+                    queued: webcodecsWritesQueued,
+                    timestampMs,
+                  },
+                })
+                .catch(() => {});
+            }
             webcodecsWriteChain = webcodecsWriteChain
               .catch(() => {})
-              .then(() => handleChunk(blob, timestampMs));
+              .then(() => handleChunk(blob, timestampMs))
+              .finally(() => {
+                webcodecsWritesQueued -= 1;
+              });
           },
           onError: (err) => {
             debugError("WebCodecsRecorder error", err);
@@ -3258,7 +3364,20 @@ const Recorder = () => {
     } catch {}
   };
 
-  async function stopRecording() {
+  function stopRecording() {
+    const wasFinishing = isFinishing.current;
+    const run = runStopRecording();
+    if (!wasFinishing) {
+      stopPromiseRef.current = run;
+      const clear = () => {
+        if (stopPromiseRef.current === run) stopPromiseRef.current = null;
+      };
+      run.then(clear, clear);
+    }
+    return run;
+  }
+
+  async function runStopRecording() {
     localStopInitiated.current = true;
     if (isFinishing.current) {
       debugWarn("stopRecording() called while already finishing");
@@ -3897,7 +4016,20 @@ const Recorder = () => {
       debug("getDisplayMedia screen constraints", displayConstraints);
       slLog("getDisplayMedia-start");
       let stream;
-      const endGdm = perfSpan("Recorder getDisplayMedia(screen)");
+      const endGdmSpan = perfSpan("Recorder getDisplayMedia(screen)");
+      // Timer drift while the picker and capture start run: a starved machine
+      // shows up here, a hung capture API does not.
+      let maxLagMs = 0;
+      let lastLagTick = performance.now();
+      const lagTimer = setInterval(() => {
+        const now = performance.now();
+        maxLagMs = Math.max(maxLagMs, now - lastLagTick - 200);
+        lastLagTick = now;
+      }, 200);
+      const endGdm = (meta) => {
+        clearInterval(lagTimer);
+        endGdmSpan({ ...meta, maxLagMs: Math.round(maxLagMs) });
+      };
       const acquireDisplay = (constraints) =>
         acquireDisplayMediaWithFocusRetry({
           getDisplayMedia: (c) => navigator.mediaDevices.getDisplayMedia(c),
@@ -3907,7 +4039,20 @@ const Recorder = () => {
         });
       try {
         try {
-          stream = await acquireDisplay(displayConstraints);
+          try {
+            stream = await acquireDisplay(displayConstraints);
+          } catch (err) {
+            if (err?.name !== "OverconstrainedError") throw err;
+            // Some Windows setups reject the size ceiling. Re-pick without it
+            // and encode at the tier size instead.
+            debugWarn("Display size constraints rejected, re-picking", err);
+            captureCapRef.current = { width, height, oversampled: false };
+            displayConstraints.video = {
+              frameRate: displayConstraints.video.frameRate,
+              displaySurface: "monitor",
+            };
+            stream = await acquireDisplay(displayConstraints);
+          }
         } catch (err) {
           // The audio rejection takes the video with it. getDisplayMedia only
           // fails after the user has picked, so the retry costs a second pick.
@@ -3937,10 +4082,17 @@ const Recorder = () => {
         });
       } catch (err) {
         endGdm({ error: String(err?.message || err).slice(0, 80) });
+        const errMessage = String(err?.message || "").toLowerCase();
+        // Chrome also throws AbortError for a pick that never started
+        // ("Timeout starting video source"); that is a failure, not a dismissal.
+        const sourceStartFailed =
+          err?.name === "AbortError" &&
+          /timeout|starting video source|failed to start/.test(errMessage);
         const cancelled =
-          err?.name === "NotAllowedError" ||
-          err?.name === "AbortError" ||
-          String(err?.message || "").toLowerCase().includes("permission denied");
+          !sourceStartFailed &&
+          (err?.name === "NotAllowedError" ||
+            err?.name === "AbortError" ||
+            errMessage.includes("permission denied"));
         debugWarn("getDisplayMedia screen capture failed", err);
         resetGateState();
         sendRecordingError(
@@ -5104,7 +5256,16 @@ const Recorder = () => {
           }
           // Don't stop capture tracks here: it raced a slow start (isRecording
           // not yet flipped, tracks live) and killed the screen track mid-start.
-          await new Promise((resolve) => setTimeout(resolve, 1000));
+          if (shouldFinalize && stopPromiseRef.current) {
+            // An in-flight stop (e.g. the timer alarm) makes the call above a no-op;
+            // ack after its finalize, within the timeout.
+            await Promise.race([
+              stopPromiseRef.current.catch(() => {}),
+              new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+            ]);
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
         } catch (err) {
           console.warn("[Recorder] offscreen-shutdown error", err);
         } finally {

@@ -839,10 +839,6 @@
     "message": "Микрофон отключен",
     "description": "Заголовок всплывающего окна отключенного микрофона"
   },
-  "hideUIAlerts": {
-    "message": "Скрыть уведомления интерфейса",
-    "description": "Кнопка скрытия уведомлений интерфейса"
-  },
   "noShowAgain": {
     "message": "Не показывать снова",
     "description": "Кнопка 'Не показывать снова'"
@@ -2056,5 +2052,13 @@
   "teleprompterRegionStartOnPage": {
     "message": "Запись области нужно начинать со страницы",
     "description": "Tooltip on the disabled Start button in the floating teleprompter window when recording a region, which can only be started from the page"
+  },
+  "sandboxEditorSelectionPendingHint": {
+    "message": "Сначала примените выделение кнопкой «Обрезать» или «Вырезать».",
+    "description": "Tooltip on the disabled save button while trim handles are moved but no edit has been applied"
+  },
+  "sandboxEditorAudioPendingHint": {
+    "message": "Чтобы сохранить изменения, сначала добавьте аудиофайл.",
+    "description": "Tooltip on the disabled save button in the audio editor until an audio file is added"
   }
 }

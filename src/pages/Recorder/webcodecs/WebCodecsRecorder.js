@@ -45,7 +45,7 @@ import {
 } from "./startLeadIn";
 import { avcCodecForSize, exceedsAvcL42 } from "../../../media/avcLevel";
 import { RESOLUTION_UNSUPPORTED_CODE } from "../../../media/fastRecorderGate";
-import { claimPrewarmedEncoder } from "../encoderPrewarm";
+import { claimPrewarmedEncoder, getRecentPrewarmHwError } from "../encoderPrewarm";
 // Lazy-load Mp4MuxerWrapper so its ~3MB mediabunny static import doesn't
 // drag into recorder.bundle.js cold start (dominates click-record latency).
 let _mp4MuxerWrapperPromise = null;
@@ -246,6 +246,8 @@ export class WebCodecsRecorder {
     this._startupWindowClosed = false;
     this._startupCaughtUpRun = 0;
     this._startupFirstFrameAt = null;
+    this._heldFirstFrame = null;
+    this._firstFrameVetted = false;
     this._startupFramesSeen = 0;
     this._startupBufferEngaged = false;
     this._framesBufferedAtStart = 0;
@@ -269,6 +271,11 @@ export class WebCodecsRecorder {
         : STARTUP_HARD_FRAME_LIMIT;
     this._adoptedPrewarmEncoder = false;
     this._adoptedDecoderConfig = null;
+    this._encErrDecisions = [];
+    this._closedEncoderDrops = 0;
+    this._closedEncoderRebuilds = 0;
+    this._closedRebuildTried = false;
+    this._firstFedAt = null;
     this._forceNextKeyframe = false;
     this._droppedForBackpressureCount = 0;
     // 100, not 10. At ~10-25ms per chunk, 10 was ~100-200ms of headroom against
@@ -382,6 +389,7 @@ export class WebCodecsRecorder {
     // slots, not frames. Tells a quiet source from a loop discarding frames.
     this._framesDroppedAheadOfClock = 0;
     this._framesSkippedForGap = 0;
+    this._heldGapSamples = 0;
     // Black placeholder frames synthesized before the first real frame to
     // bridge macOS static-screen first-frame starvation (see readVideoLoop).
     this._syntheticFirstFrameCount = 0;
@@ -495,6 +503,13 @@ export class WebCodecsRecorder {
     // reused instance can salvage again on a second recording.
     this._didSwRetry = false;
     this._swRetryReason = null;
+    this._encErrDecisions = [];
+    this._closedEncoderDrops = 0;
+    this._closedEncoderRebuilds = 0;
+    this._closedRebuildTried = false;
+    this._framesFed = 0;
+    this._firstFedAt = null;
+    this._videoCodecConfigsTried = [];
     this._hiddenRearmCount = 0;
     this._lastChunkAt = null;
     // A reused instance gets a fresh muxer, so neither latch may carry over.
@@ -505,6 +520,8 @@ export class WebCodecsRecorder {
     this._startupWindowClosed = false;
     this._startupCaughtUpRun = 0;
     this._startupFirstFrameAt = null;
+    this._heldFirstFrame = null;
+    this._firstFrameVetted = false;
     this._startupFramesSeen = 0;
     this._startupBufferEngaged = false;
     this._framesBufferedAtStart = 0;
@@ -517,6 +534,7 @@ export class WebCodecsRecorder {
     this._pendingAudioRead = null;
     this._framesDroppedAheadOfClock = 0;
     this._framesSkippedForGap = 0;
+    this._heldGapSamples = 0;
     this._droppedForBackpressureCount = 0;
     this._droppedAudioForBackpressureCount = 0;
     this._peakVideoEncodeQueueSize = 0;
@@ -1061,6 +1079,7 @@ export class WebCodecsRecorder {
               keyFrame: false,
             });
             this._framesFed += 1;
+            if (this._firstFedAt == null) this._firstFedAt = performance.now();
           } finally {
             hold.close();
           }
@@ -1202,6 +1221,7 @@ export class WebCodecsRecorder {
         // lastFailureCode names the cause on salvaged partials.
         await this.options.onFinalized({
           muxerFinalizeOk,
+          muxerBytes: this.muxer?.getStats?.()?.totalEmittedBytes ?? null,
           framesEncoded: this.frameCount,
           firstChunkSeen: this._firstChunkSeen,
           droppedForBackpressure: {
@@ -1426,10 +1446,14 @@ export class WebCodecsRecorder {
       staticFrameSyntheticCount: this._staticFrameSyntheticCount,
       framesDroppedAheadOfClock: this._framesDroppedAheadOfClock,
       framesSkippedForGap: this._framesSkippedForGap,
+      heldGapSamples: this._heldGapSamples,
       trackStats: this._readTrackStats(),
       firstChunkLatencyMs,
       videoEncoderStateAtStop: this._videoEncoderStateAtStop,
       encoderConstructCount: this._encoderConstructCount,
+      closedEncoderDrops: this._closedEncoderDrops,
+      closedEncoderRebuilds: this._closedEncoderRebuilds,
+      encoderErrorDecisions: this._encErrDecisions.slice(),
       lastWebCodecsFailureCode: this._lastFailureCode || null,
     };
   }
@@ -1800,9 +1824,71 @@ export class WebCodecsRecorder {
     this._deviceChangeListener = null;
   }
 
+  // Healthy starts emit within ~1.4s; a dead hardware encoder emits nothing until the
+  // 12s watchdog. With nothing out by the early mark the picture is already frozen,
+  // so a software rebuild costs nothing a wait would save. Hidden tabs are left to the watchdog.
+  _armEarlyFirstChunkCheck(delayMs) {
+    const earlyMs = Number.isFinite(this.options?.earlyFirstChunkMs)
+      ? this.options.earlyFirstChunkMs
+      : this._firstChunkWatchdogMs >= 8000
+        ? 4000
+        : 0;
+    if (!(earlyMs > 0) || earlyMs >= this._firstChunkWatchdogMs) return;
+    const minFedMs = Math.min(3000, earlyMs * 0.75);
+    this._earlyFirstChunkTimer = setTimeout(() => {
+      this._earlyFirstChunkTimer = null;
+      if (
+        !this.running ||
+        this._stopping ||
+        this.paused ||
+        this.justResumed ||
+        this._encodersClosedForPause ||
+        this._firstChunkSeen ||
+        this._didSwRetry ||
+        this._failureReported ||
+        !(this._framesFed > 0)
+      ) {
+        return;
+      }
+      // Measured from the first frame the encoder was given, so a late first
+      // frame (static screen) does not make a healthy encoder look dead.
+      const fedForMs = performance.now() - (this._firstFedAt ?? performance.now());
+      if (fedForMs < minFedMs) {
+        this._armEarlyFirstChunkCheck(minFedMs - fedForMs + 50);
+        return;
+      }
+      if (
+        typeof document !== "undefined" &&
+        document.visibilityState === "hidden"
+      ) {
+        return;
+      }
+      const cfg = this._activeVideoConfig;
+      if (!cfg || cfg.hardwareAcceleration === "prefer-software") return;
+      this.warn("[WCR] no first chunk early; rebuilding prefer-software", {
+        afterMs: earlyMs,
+      });
+      try {
+        diagForward("recorder-no-first-chunk-sw-rebuild", {
+          withinMs: earlyMs,
+          early: true,
+        });
+      } catch {}
+      if (this._rebuildVideoEncoder({ ...cfg, hardwareAcceleration: "prefer-software" })) {
+        this._didSwRetry = true;
+        this._swRetryReason = this._swRetryReason || "early-no-first-chunk";
+        this._forceNextKeyframe = true;
+        this._restartVideoTimelineBeforeFirstChunk();
+        this._noteEncoderErrorDecision("early-rebuild");
+        this._armFirstChunkWatchdog();
+      }
+    }, delayMs ?? earlyMs);
+  }
+
   _armFirstChunkWatchdog() {
     this._clearFirstChunkWatchdog();
     if (this._firstChunkSeen) return;
+    this._armEarlyFirstChunkCheck();
     this._firstChunkWatchdog = setTimeout(() => {
       this._firstChunkWatchdog = null;
       if (!this.running || this._stopping || this._firstChunkSeen) return;
@@ -1831,6 +1917,7 @@ export class WebCodecsRecorder {
       const isHwConfig =
         cfg &&
         (cfg.hardwareAcceleration === "prefer-hardware" ||
+          cfg.hardwareAcceleration === "no-preference" ||
           !cfg.hardwareAcceleration);
       if (
         this.running &&
@@ -1858,6 +1945,7 @@ export class WebCodecsRecorder {
           this._didSwRetry = true;
           this._swRetryReason = this._swRetryReason || "no-first-chunk";
           this._forceNextKeyframe = true;
+          this._restartVideoTimelineBeforeFirstChunk();
           this._armFirstChunkWatchdog();
           return;
         }
@@ -1875,6 +1963,10 @@ export class WebCodecsRecorder {
   }
 
   _clearFirstChunkWatchdog() {
+    if (this._earlyFirstChunkTimer) {
+      clearTimeout(this._earlyFirstChunkTimer);
+      this._earlyFirstChunkTimer = null;
+    }
     if (this._firstChunkWatchdog) {
       clearTimeout(this._firstChunkWatchdog);
       this._firstChunkWatchdog = null;
@@ -2196,10 +2288,21 @@ export class WebCodecsRecorder {
       return;
     }
 
-    this.videoEncoder = new VideoEncoder({
-      output: videoEncoderOutput,
-      error: videoEncoderError,
-    });
+    const newGuardedEncoder = () => {
+      let enc = null;
+      enc = new VideoEncoder({
+        output: (chunk, meta) => {
+          if (this.videoEncoder !== enc) return;
+          videoEncoderOutput(chunk, meta);
+        },
+        error: (err) => {
+          if (this.videoEncoder !== enc) return;
+          videoEncoderError(err);
+        },
+      });
+      return enc;
+    };
+    this.videoEncoder = newGuardedEncoder();
     this._encoderConstructCount += 1;
 
     // configure() can throw sync. retry hardware→software on quota/contention
@@ -2245,10 +2348,7 @@ export class WebCodecsRecorder {
       try {
         this.videoEncoder.close();
       } catch {}
-      this.videoEncoder = new VideoEncoder({
-        output: videoEncoderOutput,
-        error: videoEncoderError,
-      });
+      this.videoEncoder = newGuardedEncoder();
       this._encoderConstructCount += 1;
     };
     const isContention = (err) => {
@@ -2527,12 +2627,14 @@ export class WebCodecsRecorder {
     // Re-entry guard: stop()'s flush during _finalizeOnFatal can fire
     // a second error from the same encoder.
     if (this._finalizingFromFatal) {
+      this._noteEncoderErrorDecision("finalizing");
       return;
     }
 
     // Pause closed the encoder. Swallow the racing reclaim error;
     // resume() rebuilds from _activeVideoConfig.
     if (this._encodersClosedForPause && isReclaim) {
+      this._noteEncoderErrorDecision("pause-swallow");
       return;
     }
 
@@ -2558,6 +2660,7 @@ export class WebCodecsRecorder {
           this._reclaimRebuildThrottleMs,
         )
       ) {
+        this._noteEncoderErrorDecision("reclaim-throttled");
         return;
       }
       this._encoderReclaimCount += 1;
@@ -2571,14 +2674,19 @@ export class WebCodecsRecorder {
       });
       if (this._rebuildVideoEncoder(this._activeVideoConfig)) {
         this._forceNextKeyframe = true;
+        this._restartVideoTimelineBeforeFirstChunk();
+        this._noteEncoderErrorDecision("reclaim-rebuild");
         return;
       }
     }
 
     const preFirstChunk = !this._firstChunkSeen;
+    // no-preference can resolve to the hardware encoder, so a pre-first-chunk
+    // error on that rung needs the same software retry as prefer-hardware.
     const isHwPreferred =
       this._activeVideoConfig &&
       (this._activeVideoConfig.hardwareAcceleration === "prefer-hardware" ||
+        this._activeVideoConfig.hardwareAcceleration === "no-preference" ||
         !this._activeVideoConfig.hardwareAcceleration);
     if (preFirstChunk && canRecover && isHwPreferred && !this._didSwRetry) {
       this._didSwRetry = true;
@@ -2593,11 +2701,23 @@ export class WebCodecsRecorder {
       };
       if (this._rebuildVideoEncoder(swConfig)) {
         this._forceNextKeyframe = true;
+        this._restartVideoTimelineBeforeFirstChunk();
+        this._noteEncoderErrorDecision("sw-retry-ok");
         return;
       }
+      this._noteEncoderErrorDecision("sw-retry-failed");
     }
 
     this.err("[WCR] VideoEncoder error:", err);
+    const decision = this._noteEncoderErrorDecision(
+      "fell-to-onError",
+      { canRecover: Boolean(canRecover), isHwPreferred: Boolean(isHwPreferred) },
+    );
+    try {
+      if (err && typeof err === "object" && !err.detail) {
+        err.detail = { decision };
+      }
+    } catch {}
 
     // Fatal mid-recording with chunks on disk. Run stop() so the muxer
     // writes moov, then surface the error tagged finalized for salvage.
@@ -2682,6 +2802,74 @@ export class WebCodecsRecorder {
     this.options.onError?.(err);
   }
 
+  // The first sample (held from 0 to the first frame's slot) can die with its encoder.
+  // The muxer rebases video to its first chunk, so a replacement starting at a later
+  // slot drops the lead-in and plays video early against the padded audio. Re-feed from slot 0.
+  _restartVideoTimelineBeforeFirstChunk() {
+    if (this._firstChunkSeen || !this._videoStartUs || this.justResumed) return;
+    this._videoFrameIndex = 0;
+    this._videoLeadInPending = true;
+  }
+
+  // An encoder that closed itself before any chunk (the browser tore down a
+  // failed hardware encoder) looks like a pause race and its frames are
+  // dropped silently. Rebuild in software once; any other case keeps the drop.
+  _rebuildClosedEncoderBeforeFirstChunk() {
+    const cfg = this._activeVideoConfig;
+    if (
+      this.paused ||
+      this._encodersClosedForPause ||
+      !this.running ||
+      this._stopping ||
+      this._finalizingFromFatal ||
+      this._firstChunkSeen ||
+      this._didSwRetry ||
+      this._closedRebuildTried ||
+      !cfg ||
+      !this._videoEncoderOutputHandler ||
+      !this._videoEncoderErrorHandler ||
+      cfg.hardwareAcceleration === "prefer-software"
+    ) {
+      return false;
+    }
+    this._closedRebuildTried = true;
+    this.warn("[WCR] VideoEncoder closed before first chunk, retrying prefer-software");
+    if (
+      !this._rebuildVideoEncoder({ ...cfg, hardwareAcceleration: "prefer-software" })
+    ) {
+      this._noteEncoderErrorDecision("closed-rebuild-failed");
+      return false;
+    }
+    this._didSwRetry = true;
+    this._swRetryReason = "closed-encoder-pre-first-chunk";
+    this._armFirstChunkWatchdog();
+    this._closedEncoderRebuilds += 1;
+    this._forceNextKeyframe = true;
+    this._restartVideoTimelineBeforeFirstChunk();
+    this._noteEncoderErrorDecision("closed-rebuild");
+    return true;
+  }
+
+  _noteEncoderErrorDecision(branch, extra) {
+    const hw = this._activeVideoConfig?.hardwareAcceleration;
+    const bits = extra
+      ? `${extra.canRecover ? 1 : 0}${extra.isHwPreferred ? 1 : 0}`
+      : "";
+    const token = [
+      branch,
+      bits,
+      hw ? hw.replace("prefer-", "p").replace("no-preference", "np") : "",
+      this._didSwRetry ? "sw" : "",
+      this._adoptedPrewarmEncoder ? "warm" : "",
+      `f${this._framesFed || 0}`,
+    ]
+      .filter(Boolean)
+      .join("/");
+    this._encErrDecisions.push(token);
+    if (this._encErrDecisions.length > 5) this._encErrDecisions.shift();
+    return token;
+  }
+
   // Fresh construct/configure with the same handlers. Error handler is
   // wrapped per-instance to drop late errors from the closed predecessor.
   _rebuildVideoEncoder(config) {
@@ -2691,7 +2879,10 @@ export class WebCodecsRecorder {
     try {
       let nextEncoder = null;
       nextEncoder = new VideoEncoder({
-        output: this._videoEncoderOutputHandler,
+        output: (chunk, meta) => {
+          if (this.videoEncoder !== nextEncoder) return;
+          this._videoEncoderOutputHandler(chunk, meta);
+        },
         error: (err) => {
           if (this.videoEncoder !== nextEncoder) return;
           this._videoEncoderErrorHandler(err);
@@ -2701,6 +2892,9 @@ export class WebCodecsRecorder {
       nextEncoder.configure(config);
       this.videoEncoder = nextEncoder;
       this._activeVideoConfig = config;
+      if (this._firstFedAt != null && !this._firstChunkSeen) {
+        this._firstFedAt = performance.now();
+      }
       return true;
     } catch (rebuildErr) {
       this.err("[WCR] VideoEncoder rebuild failed:", rebuildErr);
@@ -2856,6 +3050,23 @@ export class WebCodecsRecorder {
               { codec: "avc1.42E028", containerCodec: "avc", hw: "prefer-software" },
             ];
 
+    // The prewarm opens a hardware encoder at this same size moments earlier;
+    // if that one errored, try the software rungs first.
+    const prewarmHwError =
+      this.containerKind === "webm"
+        ? null
+        : getRecentPrewarmHwError({ width, height });
+    if (prewarmHwError) {
+      candidates.sort(
+        (x, y) =>
+          Number(x.hw !== "prefer-software") - Number(y.hw !== "prefer-software"),
+      );
+      this._videoCodecConfigsTried.push({
+        prewarmHwError,
+        succeeded: false,
+      });
+    }
+
     // Past L4.2's coded-area limit (or above 30fps) the level must rise, or
     // Chrome rejects the frame at encode time (configure() still passes).
     const oversize = exceedsAvcL42(width, height) || fps > 30;
@@ -2868,9 +3079,12 @@ export class WebCodecsRecorder {
       // Use the normalized config from isConfigSupported so a clamp
       // Chrome would have applied doesn't trigger a SW fallback later.
       let supported = null;
+      let supportedError = null;
       try {
         supported = await VideoEncoder.isConfigSupported(config);
-      } catch {}
+      } catch (e) {
+        supportedError = String(e?.name || "error").slice(0, 40);
+      }
       // configure() reports an unsupported size asynchronously, so a rung
       // isConfigSupported refused would be selected and die with zero chunks.
       // Only large frames skip on it.
@@ -2884,13 +3098,40 @@ export class WebCodecsRecorder {
       }
       const resolvedConfig =
         supported?.supported && supported.config ? supported.config : config;
-      const test = new VideoEncoder({ output() {}, error() {} });
+      let probeError = supportedError;
+      let asyncProbeError = null;
+      const test = new VideoEncoder({
+        output() {},
+        error(e) {
+          probeError = String(e?.name || "error").slice(0, 40);
+          asyncProbeError = probeError;
+        },
+      });
       try {
         test.configure(resolvedConfig);
+        // A hardware encoder that cannot be created reports it from the error
+        // callback a few ms after a clean configure(); closing at once hid that.
+        if (
+          c.hw !== "prefer-software" &&
+          candidate !== candidates[candidates.length - 1] &&
+          !(this.options?.skipProbeSettle === true)
+        ) {
+          await new Promise((r) => setTimeout(r, 60));
+          if (asyncProbeError || test.state === "closed") {
+            this._videoCodecConfigsTried.push({
+              codec: c.codec,
+              hw: c.hw,
+              succeeded: false,
+              probeError: probeError || "closed",
+            });
+            continue;
+          }
+        }
         this._videoCodecConfigsTried.push({
           codec: c.codec,
           hw: c.hw,
           succeeded: true,
+          ...(probeError ? { probeError } : {}),
         });
         this.log("[WCR] Selected encoder:", c.codec, c.hw);
         try {
@@ -2917,6 +3158,7 @@ export class WebCodecsRecorder {
           codec: c.codec,
           hw: c.hw,
           succeeded: false,
+          probeError: String(e?.name || "error").slice(0, 40),
         });
       } finally {
         try { test.close(); } catch {}
@@ -3003,6 +3245,245 @@ export class WebCodecsRecorder {
     this._videoLeadInPending = true;
   }
 
+  // A real frame N slots late used to be copied into all N slots, stamping the new
+  // picture before it existed. Those slots belong to the previous picture, so encode
+  // it while the canvas still shows it. Skipped where start, lead-in and resume own the timeline.
+  _encodeHeldGap() {
+    if (
+      !this._videoStartUs ||
+      this._videoLeadInPending ||
+      this.justResumed ||
+      this.paused ||
+      this.frameCount === 0 ||
+      !this.videoEncoder
+    ) {
+      return;
+    }
+    const frameDurationUs = this._frameDurationUs || Math.round(1_000_000 / 30);
+    const elapsedUs = Math.max(
+      0,
+      performance.now() * 1000 -
+        this._videoStartUs -
+        (this.totalPausedDurationUs || 0),
+    );
+    const targetIndex = Math.floor(elapsedUs / frameDurationUs);
+    const startIndex = this._videoFrameIndex;
+    if (targetIndex <= startIndex) return;
+    const encodedBefore = this.frameCount;
+    // Ordinary lateness keeps one sample per slot; only a real stall is one long hold.
+    if (targetIndex - startIndex <= 8) {
+      this._encodeVideoSlots({
+        startIndex,
+        frameDurationUs,
+        targetIndex: targetIndex - 1,
+      });
+    } else {
+      this._encodeVideoSlots({
+        startIndex,
+        holdUntilIndex: targetIndex - 1,
+        frameDurationUs,
+        targetIndex,
+      });
+    }
+    if (this.frameCount > encodedBefore) this._heldGapSamples += 1;
+  }
+
+  // Encodes grid slots startIndex..targetIndex off the resize canvas as it stands. With
+  // holdUntilIndex, one sample at startIndex lasting through it (start lead-in, long holds).
+  _encodeVideoSlots({
+    startIndex,
+    holdUntilIndex,
+    frameDurationUs,
+    targetIndex,
+  }) {
+    const endIndex = holdUntilIndex != null ? startIndex : targetIndex;
+    for (let i = startIndex; i <= endIndex; i += 1) {
+      const tsUs = i * frameDurationUs;
+
+      // Track the peak observed queue depth as a leading indicator
+      //; useful for tuning the threshold from real telemetry.
+      // Closed-encoder pause race: treat as drained.
+      let vQueueSize = 0;
+      try {
+        vQueueSize = this.videoEncoder?.encodeQueueSize ?? 0;
+      } catch {
+        vQueueSize = 0;
+      }
+      if (vQueueSize > this._peakVideoEncodeQueueSize) {
+        this._peakVideoEncodeQueueSize = vQueueSize;
+      }
+
+      // Startup grace window: while the encoder ramps, buffer instead of
+      // dropping. Frames carry wall-clock PTS, so they encode late but the
+      // file stays complete. Latches to the steady cap once it closes.
+      let effectiveQueueCap = this._encoderMaxQueueSize;
+      if (!this._startupWindowClosed) {
+        if (this._startupFirstFrameAt === null) {
+          this._startupFirstFrameAt = performance.now();
+        }
+        this._startupFramesSeen += 1;
+        if (vQueueSize <= STARTUP_CAUGHT_UP_QUEUE) {
+          this._startupCaughtUpRun += 1;
+        } else {
+          this._startupCaughtUpRun = 0;
+        }
+        effectiveQueueCap = computeEffectiveQueueCap({
+          framesSinceStart: this._startupFramesSeen,
+          elapsedMs: performance.now() - this._startupFirstFrameAt,
+          caughtUp: this._startupCaughtUpRun >= STARTUP_CAUGHT_UP_RUN,
+          steadyCap: this._encoderMaxQueueSize,
+          startupCap: this._startupMaxQueueSize,
+          hardFrameLimit: this._startupHardFrameLimit,
+          hardMs: this._startupHardMs,
+          disabled: getStartupFlags().startupBufferDisabled,
+        });
+        if (effectiveQueueCap <= this._encoderMaxQueueSize) {
+          this._startupWindowClosed = true;
+          effectiveQueueCap = this._encoderMaxQueueSize;
+        } else if (
+          vQueueSize > this._encoderMaxQueueSize &&
+          vQueueSize <= effectiveQueueCap
+        ) {
+          // Counts only frames the wider cap actually saves (above the
+          // steady cap, still inside the grace cap). Counting ones that
+          // drop anyway would overstate the fix in telemetry.
+          this._startupBufferEngaged = true;
+          this._framesBufferedAtStart += 1;
+        }
+      }
+
+      // Backpressure: drop the frame and force a keyframe next so
+      // the stream stays decodable. An unbounded queue can stop
+      // emitting chunks entirely.
+      if (vQueueSize > effectiveQueueCap) {
+        this._droppedForBackpressureCount += 1;
+        this._forceNextKeyframe = true;
+        // A dropped lead-in hold leaves index 0 for the retry.
+        if (holdUntilIndex == null) this._videoFrameIndex = i + 1;
+        continue;
+      }
+
+      const resized = new VideoFrame(this.resizeCanvas, {
+        timestamp: tsUs,
+        duration:
+          holdUntilIndex != null
+            ? (holdUntilIndex + 1 - i) * frameDurationUs
+            : frameDurationUs,
+      });
+
+      const keyFrame =
+        i === 0 ||
+        (this.justResumed && i === startIndex) ||
+        this._forceNextKeyframe === true ||
+        i - this._lastKeyFrameIndex >= this._keyFrameIntervalFrames;
+      if (keyFrame) {
+        this._lastKeyFrameIndex = i;
+        this._forceNextKeyframe = false;
+      }
+      if (this.justResumed && i === startIndex) {
+        this.justResumed = false;
+      }
+
+      // pause() can close the encoder between the top-of-loop check
+      // and here. Drop the frame instead of bubbling a sync throw.
+      if (
+        this.paused ||
+        !this.videoEncoder ||
+        this.videoEncoder.state === "closed"
+      ) {
+        this._closedEncoderDrops += 1;
+        resized.close();
+        if (this._rebuildClosedEncoderBeforeFirstChunk()) break;
+        if (holdUntilIndex == null) this._videoFrameIndex = i + 1;
+        this._forceNextKeyframe = true;
+        continue;
+      }
+      // try/finally so resized's GPU buffer closes on every exit
+      // (pause-race continue, rethrown encoder error, success).
+      try {
+        try {
+          this.videoEncoder.encode(resized, {
+            timestamp: tsUs,
+            keyFrame,
+          });
+          this._framesFed += 1;
+          if (this._firstFedAt == null) this._firstFedAt = performance.now();
+        } catch (encErr) {
+          // Same race after the check. Only swallow when paused
+          // so real encoder errors still surface.
+          if (
+            this.paused ||
+            this.videoEncoder?.state === "closed"
+          ) {
+            this.warn("[WCR] encode() race during pause; dropping frame");
+            this._closedEncoderDrops += 1;
+            if (this._rebuildClosedEncoderBeforeFirstChunk()) break;
+            if (holdUntilIndex == null) this._videoFrameIndex = i + 1;
+            this._forceNextKeyframe = true;
+            continue;
+          }
+          // QuotaExceededError means a full queue (Chrome 140+ backpressure,
+          // drop the frame) or a reclaimed encoder (near-empty queue). Route
+          // the reclaim case to a rebuild, not a drop into a dead encoder.
+          if (encErr?.name === "QuotaExceededError") {
+            const q = this.videoEncoder?.encodeQueueSize ?? 0;
+            // A near-empty queue only meant reclaim while the cap was 4;
+            // at 16 a real reclaim looks like backpressure and silently
+            // skips the rebuild. Chrome names reclaims in the message.
+            if (isReclaimErrorMessage(encErr) || q <= 5) {
+              if (holdUntilIndex == null) this._videoFrameIndex = i + 1;
+              this._forceNextKeyframe = true;
+              this.warn(
+                "[WCR] encode() QuotaExceededError with near-empty queue; treating as encoder reclaim, rebuilding",
+                { queue: q },
+              );
+              this._handleVideoEncoderError(encErr, true);
+              continue;
+            }
+            this._droppedForBackpressureCount += 1;
+            this._forceNextKeyframe = true;
+            if (holdUntilIndex == null) this._videoFrameIndex = i + 1;
+            this.warn(
+              "[WCR] encode() QuotaExceededError; dropping frame as backpressure",
+            );
+            continue;
+          }
+          throw encErr;
+        }
+        if (
+          this.debug &&
+          (this.frameCount < 5 || this.frameCount % 300 === 0)
+        ) {
+          this.log("[WCR] video pts", {
+            frame: this.frameCount,
+            tsUs,
+            durUs: frameDurationUs,
+            targetIndex,
+          });
+        }
+        // Diag snapshot every 30 frames. encodeQueueSize > 10 means
+        // the encoder can't keep up.
+        if (this.frameCount > 0 && this.frameCount % 30 === 0) {
+          perfMark("WCR.frame.progress", {
+            frame: this.frameCount,
+            videoQ: this.videoEncoder?.encodeQueueSize ?? -1,
+            audioQ: this.audioEncoder?.encodeQueueSize ?? -1,
+          });
+        }
+        this.frameCount++;
+        this._fpsWindows.tick(
+          this.frameCount,
+          performance.now() - (this.totalPausedDurationUs || 0) / 1000,
+        );
+        this._videoLeadInPending = false;
+        this._videoFrameIndex =
+          holdUntilIndex != null ? holdUntilIndex + 1 : i + 1;
+      } finally {
+        resized.close();
+      }
+    }
+  }
+
   async readVideoLoop() {
     this.log("[WCR] video loop start");
     if (!this.videoReader || !this.videoEncoder) return;
@@ -3080,6 +3561,10 @@ export class WebCodecsRecorder {
         // emitting and the stall watchdog would misfire. Reuse the
         // last canvas on timeout to keep chunks flowing.
         const STATIC_FRAME_FALLBACK_MS = 1500;
+        // A late-attached reader is first handed the track's cached picture,
+        // which can predate the start (the picker, the countdown). A frame that
+        // follows within this window means the held one was that leftover.
+        const FIRST_FRAME_VET_MS = 250;
         // Hoisted, not re-issued per iteration. A read that loses the race
         // isn't cancelled: it stays queued and later eats a frame nobody
         // encodes or closes, so on a static screen every timeout costs the
@@ -3095,7 +3580,7 @@ export class WebCodecsRecorder {
             }));
         }
         let fallbackTimer = null;
-        const readResult = await Promise.race([
+        let readResult = await Promise.race([
           this._pendingVideoRead,
           new Promise((resolve) => {
             fallbackTimer = setTimeout(
@@ -3105,7 +3590,9 @@ export class WebCodecsRecorder {
                   value: null,
                   isSyntheticTimeout: true,
                 }),
-              STATIC_FRAME_FALLBACK_MS,
+              this._heldFirstFrame
+                ? FIRST_FRAME_VET_MS
+                : STATIC_FRAME_FALLBACK_MS,
             );
           }),
         ]);
@@ -3113,6 +3600,17 @@ export class WebCodecsRecorder {
           // Consumed: clear before any early continue below.
           this._pendingVideoRead = null;
           if (fallbackTimer) clearTimeout(fallbackTimer);
+        }
+
+        // Nothing followed the held frame: a static screen, so it is the picture.
+        if (readResult.isSyntheticTimeout && this._heldFirstFrame) {
+          readResult = {
+            done: false,
+            value: this._heldFirstFrame,
+            isSyntheticTimeout: false,
+          };
+          this._heldFirstFrame = null;
+          this._firstFrameVetted = true;
         }
 
         let isSynthetic = false;
@@ -3158,6 +3656,18 @@ export class WebCodecsRecorder {
           }
           if (readResult.done || !readResult.value) break;
           frame = readResult.value;
+          if (!this._videoStartUs && !this._firstFrameVetted) {
+            if (this._heldFirstFrame) {
+              try {
+                this._heldFirstFrame.close();
+              } catch {}
+              this._heldFirstFrame = null;
+              this._firstFrameVetted = true;
+            } else {
+              this._heldFirstFrame = frame;
+              continue;
+            }
+          }
           this._framesFromMSTP += 1;
           // Drives the sleep-gap detection above.
           this._lastFrameArrivalAt = performance.now();
@@ -3173,6 +3683,9 @@ export class WebCodecsRecorder {
           }
 
           ensureResizeCanvas();
+
+          // Must run before the draw: the canvas still holds the picture the late slots should show.
+          this._encodeHeldGap();
 
           this.drawFrameToResizeCanvas(frame);
 
@@ -3221,187 +3734,12 @@ export class WebCodecsRecorder {
         }
 
         const startIndex = this._videoFrameIndex;
-        const endIndex = holdUntilIndex != null ? startIndex : targetIndex;
-        for (let i = startIndex; i <= endIndex; i += 1) {
-          const tsUs = i * frameDurationUs;
-
-          // Track the peak observed queue depth as a leading indicator
-          //; useful for tuning the threshold from real telemetry.
-          // Closed-encoder pause race: treat as drained.
-          let vQueueSize = 0;
-          try {
-            vQueueSize = this.videoEncoder?.encodeQueueSize ?? 0;
-          } catch {
-            vQueueSize = 0;
-          }
-          if (vQueueSize > this._peakVideoEncodeQueueSize) {
-            this._peakVideoEncodeQueueSize = vQueueSize;
-          }
-
-          // Startup grace window: while the encoder ramps, buffer instead of
-          // dropping. Frames carry wall-clock PTS, so they encode late but the
-          // file stays complete. Latches to the steady cap once it closes.
-          let effectiveQueueCap = this._encoderMaxQueueSize;
-          if (!this._startupWindowClosed) {
-            if (this._startupFirstFrameAt === null) {
-              this._startupFirstFrameAt = performance.now();
-            }
-            this._startupFramesSeen += 1;
-            if (vQueueSize <= STARTUP_CAUGHT_UP_QUEUE) {
-              this._startupCaughtUpRun += 1;
-            } else {
-              this._startupCaughtUpRun = 0;
-            }
-            effectiveQueueCap = computeEffectiveQueueCap({
-              framesSinceStart: this._startupFramesSeen,
-              elapsedMs: performance.now() - this._startupFirstFrameAt,
-              caughtUp: this._startupCaughtUpRun >= STARTUP_CAUGHT_UP_RUN,
-              steadyCap: this._encoderMaxQueueSize,
-              startupCap: this._startupMaxQueueSize,
-              hardFrameLimit: this._startupHardFrameLimit,
-              hardMs: this._startupHardMs,
-              disabled: getStartupFlags().startupBufferDisabled,
-            });
-            if (effectiveQueueCap <= this._encoderMaxQueueSize) {
-              this._startupWindowClosed = true;
-              effectiveQueueCap = this._encoderMaxQueueSize;
-            } else if (
-              vQueueSize > this._encoderMaxQueueSize &&
-              vQueueSize <= effectiveQueueCap
-            ) {
-              // Counts only frames the wider cap actually saves (above the
-              // steady cap, still inside the grace cap). Counting ones that
-              // drop anyway would overstate the fix in telemetry.
-              this._startupBufferEngaged = true;
-              this._framesBufferedAtStart += 1;
-            }
-          }
-
-          // Backpressure: drop the frame and force a keyframe next so
-          // the stream stays decodable. An unbounded queue can stop
-          // emitting chunks entirely.
-          if (vQueueSize > effectiveQueueCap) {
-            this._droppedForBackpressureCount += 1;
-            this._forceNextKeyframe = true;
-            // A dropped lead-in hold leaves index 0 for the retry.
-            if (holdUntilIndex == null) this._videoFrameIndex = i + 1;
-            continue;
-          }
-
-          const resized = new VideoFrame(this.resizeCanvas, {
-            timestamp: tsUs,
-            duration:
-              holdUntilIndex != null
-                ? (holdUntilIndex + 1 - i) * frameDurationUs
-                : frameDurationUs,
-          });
-
-          const keyFrame =
-            i === 0 ||
-            (this.justResumed && i === startIndex) ||
-            this._forceNextKeyframe === true ||
-            i - this._lastKeyFrameIndex >= this._keyFrameIntervalFrames;
-          if (keyFrame) {
-            this._lastKeyFrameIndex = i;
-            this._forceNextKeyframe = false;
-          }
-          if (this.justResumed && i === startIndex) {
-            this.justResumed = false;
-          }
-
-          // pause() can close the encoder between the top-of-loop check
-          // and here. Drop the frame instead of bubbling a sync throw.
-          if (
-            this.paused ||
-            !this.videoEncoder ||
-            this.videoEncoder.state === "closed"
-          ) {
-            resized.close();
-            if (holdUntilIndex == null) this._videoFrameIndex = i + 1;
-            this._forceNextKeyframe = true;
-            continue;
-          }
-          // try/finally so resized's GPU buffer closes on every exit
-          // (pause-race continue, rethrown encoder error, success).
-          try {
-            try {
-              this.videoEncoder.encode(resized, {
-                timestamp: tsUs,
-                keyFrame,
-              });
-              this._framesFed += 1;
-            } catch (encErr) {
-              // Same race after the check. Only swallow when paused
-              // so real encoder errors still surface.
-              if (
-                this.paused ||
-                this.videoEncoder?.state === "closed"
-              ) {
-                this.warn("[WCR] encode() race during pause; dropping frame");
-                if (holdUntilIndex == null) this._videoFrameIndex = i + 1;
-                this._forceNextKeyframe = true;
-                continue;
-              }
-              // QuotaExceededError means a full queue (Chrome 140+ backpressure,
-              // drop the frame) or a reclaimed encoder (near-empty queue). Route
-              // the reclaim case to a rebuild, not a drop into a dead encoder.
-              if (encErr?.name === "QuotaExceededError") {
-                const q = this.videoEncoder?.encodeQueueSize ?? 0;
-                // A near-empty queue only meant reclaim while the cap was 4;
-                // at 16 a real reclaim looks like backpressure and silently
-                // skips the rebuild. Chrome names reclaims in the message.
-                if (isReclaimErrorMessage(encErr) || q <= 5) {
-                  if (holdUntilIndex == null) this._videoFrameIndex = i + 1;
-                  this._forceNextKeyframe = true;
-                  this.warn(
-                    "[WCR] encode() QuotaExceededError with near-empty queue; treating as encoder reclaim, rebuilding",
-                    { queue: q },
-                  );
-                  this._handleVideoEncoderError(encErr, true);
-                  continue;
-                }
-                this._droppedForBackpressureCount += 1;
-                this._forceNextKeyframe = true;
-                if (holdUntilIndex == null) this._videoFrameIndex = i + 1;
-                this.warn(
-                  "[WCR] encode() QuotaExceededError; dropping frame as backpressure",
-                );
-                continue;
-              }
-              throw encErr;
-            }
-            if (
-              this.debug &&
-              (this.frameCount < 5 || this.frameCount % 300 === 0)
-            ) {
-              this.log("[WCR] video pts", {
-                frame: this.frameCount,
-                tsUs,
-                durUs: frameDurationUs,
-                targetIndex,
-              });
-            }
-            // Diag snapshot every 30 frames. encodeQueueSize > 10 means
-            // the encoder can't keep up.
-            if (this.frameCount > 0 && this.frameCount % 30 === 0) {
-              perfMark("WCR.frame.progress", {
-                frame: this.frameCount,
-                videoQ: this.videoEncoder?.encodeQueueSize ?? -1,
-                audioQ: this.audioEncoder?.encodeQueueSize ?? -1,
-              });
-            }
-            this.frameCount++;
-            this._fpsWindows.tick(
-              this.frameCount,
-              performance.now() - (this.totalPausedDurationUs || 0) / 1000,
-            );
-            this._videoLeadInPending = false;
-            this._videoFrameIndex =
-              holdUntilIndex != null ? holdUntilIndex + 1 : i + 1;
-          } finally {
-            resized.close();
-          }
-        }
+        this._encodeVideoSlots({
+          startIndex,
+          holdUntilIndex,
+          frameDurationUs,
+          targetIndex,
+        });
 
         // Only close a real source frame; the synthetic path reuses
         // the existing resize-canvas content and has no incoming frame.
@@ -3413,6 +3751,11 @@ export class WebCodecsRecorder {
       // real cause (e.g. a synchronous encode() throw) to onError.
       this._videoLoopError = err;
     }
+
+    try {
+      this._heldFirstFrame?.close();
+    } catch {}
+    this._heldFirstFrame = null;
 
     this.log("[WCR] video loop exit", this.frameCount, "running=", this.running);
     // Loop exited while running; stop audio so it doesn't outlast video.

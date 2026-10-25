@@ -132,20 +132,17 @@ const WaveformGenerator = (props) => {
     if (contentState.updatePlayerTime) return;
     if (waveformContainerRef.current === null) return;
 
-    const video = document.createElement("video");
-    video.preload = "metadata";
-    video.onloadedmetadata = async () => {
-      const containerRect =
-        waveformContainerRef.current.getBoundingClientRect();
-      const cursorX =
-        containerRect.width * (contentState.time / video.duration);
-      customCursorRef.current.style.left = `${cursorX}px`;
-
-      URL.revokeObjectURL(video.src);
-      video.remove();
-    };
-    video.src = URL.createObjectURL(contentState.blob);
-  }, [contentState.time, contentState.blob, waveformContainerRef.current]);
+    if (!(contentState.duration > 0)) return;
+    const containerRect = waveformContainerRef.current.getBoundingClientRect();
+    const cursorX =
+      containerRect.width * (contentState.time / contentState.duration);
+    customCursorRef.current.style.left = `${cursorX}px`;
+  }, [
+    contentState.time,
+    contentState.blob,
+    contentState.duration,
+    waveformContainerRef.current,
+  ]);
 
   return (
     <div style={{ height: "100%" }}>

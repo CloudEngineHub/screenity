@@ -839,10 +839,6 @@
     "message": "माइक्रोफ़ोन बंद है",
     "description": "माइक्रोफ़ोन बंद टोस्ट शीर्षक"
   },
-  "hideUIAlerts": {
-    "message": "UI सूचनाओं को छुपाएं",
-    "description": "UI सूचनाओं को छुपाएं बटन"
-  },
   "noShowAgain": {
     "message": "फिर से दिखाना नहीं",
     "description": "फिर से दिखाना नहीं बटन"
@@ -2056,5 +2052,13 @@
   "teleprompterRegionStartOnPage": {
     "message": "क्षेत्र की रिकॉर्डिंग पेज से ही शुरू करनी होगी",
     "description": "Tooltip on the disabled Start button in the floating teleprompter window when recording a region, which can only be started from the page"
+  },
+  "sandboxEditorSelectionPendingHint": {
+    "message": "पहले अपने चयन को लागू करने के लिए कटा या खंड काटें का उपयोग करें।",
+    "description": "Tooltip on the disabled save button while trim handles are moved but no edit has been applied"
+  },
+  "sandboxEditorAudioPendingHint": {
+    "message": "परिवर्तन सहेजने के लिए पहले एक ऑडियो फ़ाइल जोड़ें।",
+    "description": "Tooltip on the disabled save button in the audio editor until an audio file is added"
   }
 }

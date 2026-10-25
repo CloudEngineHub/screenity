@@ -384,7 +384,18 @@ const Recorder = () => {
     lastEstimateAt.current = now;
 
     try {
-      const { usage = 0, quota = 0 } = await navigator.storage.estimate();
+      // A hung estimate() would freeze the drain, so bound it. A timeout is
+      // "slow", not "low", and falls through to the catch's keep-going verdict.
+      let estimateTimer = null;
+      const { usage = 0, quota = 0 } = await Promise.race([
+        navigator.storage.estimate(),
+        new Promise((_, reject) => {
+          estimateTimer = setTimeout(
+            () => reject(new Error("storage-estimate-timeout")),
+            5000,
+          );
+        }),
+      ]).finally(() => clearTimeout(estimateTimer));
       const remaining = quota - usage;
       const reserve = Math.max(
         MIN_HEADROOM,
@@ -659,10 +670,23 @@ const Recorder = () => {
   }
 
   async function waitForDrain() {
-    // Cap so a wedged drain doesn't block stop forever.
-    const deadline = Date.now() + 30000;
+    // Wait while fragments keep landing; give up only after a long stretch
+    // with no progress, or an absolute cap, so a wedged drain can't block stop.
+    const start = Date.now();
+    let lastProgressAt = start;
+    let lastSaved = savedCount.current;
+    let lastPending = pending.current.length;
     while (draining.current || pending.current.length) {
-      if (Date.now() > deadline) {
+      const now = Date.now();
+      if (
+        savedCount.current !== lastSaved ||
+        pending.current.length !== lastPending
+      ) {
+        lastSaved = savedCount.current;
+        lastPending = pending.current.length;
+        lastProgressAt = now;
+      }
+      if (now - lastProgressAt > 30000 || now - start > 240000) {
         console.warn("[Region] waitForDrain timed out", {
           pending: pending.current.length,
           draining: draining.current,

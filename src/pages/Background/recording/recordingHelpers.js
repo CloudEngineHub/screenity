@@ -304,27 +304,36 @@ export const handleRecordingError = async (request) => {
     type: "recording-error",
     error: request?.error || null,
     why: request?.why || null,
-  }).then(() => {
-    const candidateTabs = [activeTab, recordingUiTabId, tabRecordedID].filter(
-      (id, idx, arr) => Number.isInteger(id) && arr.indexOf(id) === idx,
-    );
-    candidateTabs.forEach((id) => {
-      sendMessageTab(id, { type: "stop-pending" }).catch(() => {});
-    });
-    // refocus only when no editor is open
-    if (!sandboxAlive) {
-      focusTab(activeTab);
-    }
-    if (request.error === "stream-error") {
-      // `why` carries the server's reason word, which is what picks the
-      // lapsed-subscription copy from the never-subscribed one.
-      sendMessageTab(activeTab, {
-        type: "stream-error",
-        errorCode,
-        why: request?.why || null,
+  })
+    // The recorder that reported this is usually being torn down, so the relay
+    // can reject; the user must still hear about it.
+    .catch((err) => {
+      diagEvent("warning", {
+        note: "recording-error relay undelivered",
+        err: String(err).slice(0, 80),
       });
-    }
-  });
+    })
+    .then(() => {
+      const candidateTabs = [activeTab, recordingUiTabId, tabRecordedID].filter(
+        (id, idx, arr) => Number.isInteger(id) && arr.indexOf(id) === idx,
+      );
+      candidateTabs.forEach((id) => {
+        sendMessageTab(id, { type: "stop-pending" }).catch(() => {});
+      });
+      // refocus only when no editor is open
+      if (!sandboxAlive) {
+        focusTab(activeTab);
+      }
+      if (request.error === "stream-error") {
+        // `why` carries the server's reason word, which is what picks the
+        // lapsed-subscription copy from the never-subscribed one.
+        sendMessageTab(activeTab, {
+          type: "stream-error",
+          errorCode,
+          why: request?.why || null,
+        });
+      }
+    });
 
   const { recordingTab } = await chrome.storage.local.get(["recordingTab"]);
   if (recordingTab) {

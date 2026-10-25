@@ -39,8 +39,10 @@ const post = (payload) => {
 
 // crbug/453704691: createSyncAccessHandle can throw NoModificationAllowedError
 // briefly while GC reclaims a prior handle. Retry with backoff before failing.
-const openSyncAccessHandleWithRetry = async (handle) => {
-  const delaysMs = [0, 200, 400, 600, 800];
+const openSyncAccessHandleWithRetry = async (
+  handle,
+  delaysMs = [0, 200, 400, 600, 800],
+) => {
   let lastErr = null;
   for (let i = 0; i < delaysMs.length; i += 1) {
     if (delaysMs[i] > 0) {
@@ -73,6 +75,28 @@ const openFile = async (recordingId, extension, keepNames = []) => {
   closed = false;
   await clearPreviousRecordings(name, keepNames);
   devLog("open", { fileName: name });
+  return { fileName: name };
+};
+
+// Resume on the same file after a hung worker was replaced. Truncating to the last
+// acknowledged size drops any half-landed write, keeping the stream contiguous.
+const reopenFile = async (name, at) => {
+  const dir = await navigator.storage.getDirectory();
+  const handle = await dir.getFileHandle(name);
+  const sync = await openSyncAccessHandleWithRetry(
+    handle,
+    [0, 200, 400, 800, 1600, 3200, 3200],
+  );
+  if (sync.getSize() < at) {
+    sync.close();
+    throw new Error("opfs-reopen-file-shorter-than-acked");
+  }
+  sync.truncate(at);
+  fileName = name;
+  syncHandle = sync;
+  offset = at;
+  closed = false;
+  devLog("reopen", { fileName: name, at });
   return { fileName: name };
 };
 
@@ -170,6 +194,23 @@ self.onmessage = (e) => {
           msg.extension,
           msg.keepNames,
         );
+        post({ type: "ready", requestId: msg.requestId, ok: true, fileName: fn });
+      } catch (err) {
+        post({
+          type: "ready",
+          requestId: msg.requestId,
+          ok: false,
+          ...errorPayload(err),
+        });
+      }
+    });
+    return;
+  }
+
+  if (msg.type === "reopen") {
+    enqueue(async () => {
+      try {
+        const { fileName: fn } = await reopenFile(msg.fileName, msg.at);
         post({ type: "ready", requestId: msg.requestId, ok: true, fileName: fn });
       } catch (err) {
         post({

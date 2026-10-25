@@ -839,10 +839,6 @@
     "message": "Mikrofon dimatikan",
     "description": "Judul toast Mikrofon dimatikan"
   },
-  "hideUIAlerts": {
-    "message": "Sembunyikan notifikasi UI",
-    "description": "Tombol Sembunyikan notifikasi UI"
-  },
   "noShowAgain": {
     "message": "Jangan tampilkan lagi",
     "description": "Tombol Jangan tampilkan lagi"
@@ -2056,5 +2052,13 @@
   "teleprompterRegionStartOnPage": {
     "message": "Perekaman area harus dimulai dari halaman",
     "description": "Tooltip on the disabled Start button in the floating teleprompter window when recording a region, which can only be started from the page"
+  },
+  "sandboxEditorSelectionPendingHint": {
+    "message": "Gunakan Potong untuk menerapkan pilihan Anda terlebih dahulu.",
+    "description": "Tooltip on the disabled save button while trim handles are moved but no edit has been applied"
+  },
+  "sandboxEditorAudioPendingHint": {
+    "message": "Tambahkan file audio terlebih dahulu untuk menyimpan perubahan.",
+    "description": "Tooltip on the disabled save button in the audio editor until an audio file is added"
   }
 }

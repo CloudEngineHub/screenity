@@ -1,5 +1,6 @@
 import { setContentState } from "../context/ContentState";
 import { cameraCanLiveInWindow, prompterCaptureStatus } from "./prompterRules";
+import { loadPrompterSettings } from "./prompterSettings";
 import {
   closePipLayer,
   getPipLayers,
@@ -12,16 +13,19 @@ import {
 const NO_PROMPT_KEY = "teleprompterFullScreenNoPrompt";
 
 // Burnt-in camera: once a full-screen capture closes the script, the camera takes the window.
-const giveWindowToCamera = (state) => {
+// A camera the user moved to the page stays there, or the window would hold a blank panel
+// next to a bubble that is also on the page.
+export const giveWindowToCamera = async (state) => {
   const own = cameraCanLiveInWindow({
     cloud: process.env.SCREENITY_ENABLE_CLOUD_FEATURES === "true",
     subscribed: state.isSubscribed,
     instantMode: state.instantMode,
   });
   if (own || state.recordingType !== "screen") return;
-  if (state.cameraActive && state.defaultVideoInput !== "none") {
-    openPipLayer("camera", "gate: full screen");
-  }
+  if (!state.cameraActive || state.defaultVideoInput === "none") return;
+  const { showCamera } = await loadPrompterSettings();
+  if (showCamera === false) return;
+  openPipLayer("camera", "gate: full screen");
 };
 
 const msg = (key, fallback) => chrome.i18n.getMessage(key) || fallback;
@@ -178,7 +182,7 @@ export const runPrompterStartGate = async (state) => {
   if (getPrompterKeepVisible()) return;
   // Controls-only window needs no prompt, the toolbar is visible.
   if (!getPipLayers().prompter) {
-    giveWindowToCamera(state);
+    await giveWindowToCamera(state);
     closePipLayer("controls", "gate: full screen");
     return startCameraCloseNotice(state);
   }
@@ -186,7 +190,7 @@ export const runPrompterStartGate = async (state) => {
   // No countdown: close the script and toast instead of asking.
   const { remembered, countdownOn } = await readGatePrefs();
   if (!countdownOn && !remembered) {
-    giveWindowToCamera(state);
+    await giveWindowToCamera(state);
     closeScriptWindow("gate: no countdown");
     state.openToast?.(
       msg("teleprompterFullScreenTitle", "Teleprompter will be closed"),
@@ -195,7 +199,7 @@ export const runPrompterStartGate = async (state) => {
     return;
   }
   if (remembered || typeof state.openModal !== "function") {
-    giveWindowToCamera(state);
+    await giveWindowToCamera(state);
     closeScriptWindow("gate: remembered");
     return;
   }
@@ -207,7 +211,7 @@ export const runPrompterStartGate = async (state) => {
       settled = true;
       resolve(ABORTED);
     };
-    const choose = (choice) => () => {
+    const choose = (choice) => async () => {
       if (settled) return;
       settled = true;
       abortOpenPrompt = null;
@@ -227,7 +231,7 @@ export const runPrompterStartGate = async (state) => {
         if (choice === "never") {
           chrome.storage.local.set({ [NO_PROMPT_KEY]: true }).catch(() => {});
         }
-        giveWindowToCamera(state);
+        await giveWindowToCamera(state);
         closeScriptWindow("gate: closed");
       }
       resolve();

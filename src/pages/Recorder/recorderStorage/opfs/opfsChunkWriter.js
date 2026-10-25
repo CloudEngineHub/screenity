@@ -15,6 +15,11 @@ const CLOSE_TIMEOUT_BASE_MS = 30000;
 const CLOSE_TIMEOUT_PER_GB_MS = 30000;
 const CLOSE_TIMEOUT_MAX_MS = 180000;
 const ABORT_TIMEOUT_MS = 10000;
+// A hung or crashed worker is replaced and the write retried on the same file.
+const MAX_WRITER_RECOVERIES = 3;
+// Recoveries are per stall episode: a long take on a slow disk can see several
+// unrelated hiccups, so the budget refills after this many clean writes.
+const HEALTHY_WRITES_TO_REFILL = 30;
 
 // Used by Recorder.jsx's handleChunk to detect OPFS writer failure.
 export const OPFS_WRITER_FAILED_CODE = "opfs-writer-failed";
@@ -43,6 +48,26 @@ export class OpfsChunkWriter {
     // file state past the failure point is unknown.
     this._dead = false;
     this._deathError = null;
+    this._recoveries = 0;
+    this._healthyWrites = 0;
+  }
+
+  _isRecoverable(err) {
+    return err?.errorName === "TimeoutError" || err?.errorName === "WorkerError";
+  }
+
+  _abandonWorker(err) {
+    if (this.worker) {
+      try {
+        this.worker.terminate();
+      } catch {}
+      this.worker = null;
+    }
+    for (const [, entry] of this.pending) {
+      if (entry.timeoutId) clearTimeout(entry.timeoutId);
+      entry.reject(err);
+    }
+    this.pending.clear();
   }
 
   _markDead(err) {
@@ -90,7 +115,11 @@ export class OpfsChunkWriter {
     this.worker.onerror = (e) => {
       const err = new Error(String(e?.message || "opfs-worker-crashed"));
       err.errorName = "WorkerError";
-      this._markDead(err);
+      if (this._fileName && this._recoveries < MAX_WRITER_RECOVERIES) {
+        this._abandonWorker(err);
+      } else {
+        this._markDead(err);
+      }
     };
   }
 
@@ -111,9 +140,24 @@ export class OpfsChunkWriter {
             `opfs-${message.type}-timeout after ${timeout}ms`,
           );
           timeoutErr.errorName = "TimeoutError";
-          this._markDead(timeoutErr);
+          if (
+            message.type === "write" &&
+            this._recoveries < MAX_WRITER_RECOVERIES
+          ) {
+            this._abandonWorker(timeoutErr);
+            reject(timeoutErr);
+          } else {
+            this._markDead(timeoutErr);
+            reject(this._deathError);
+          }
         }
       }, timeout);
+      // E2E seam: swallow N writes so the worker never answers, like a hang.
+      const g = /** @type {any} */ (globalThis);
+      if (message.type === "write" && g.__screenityDropOpfsWrites > 0) {
+        g.__screenityDropOpfsWrites -= 1;
+        return;
+      }
       this.worker.postMessage({ ...message, requestId });
     });
   }
@@ -155,14 +199,80 @@ export class OpfsChunkWriter {
     }
     // index/timestamp accepted to match IdbChunkWriter; OPFS is ordered
     // by write position so they aren't stored.
-    const resp = await this._request({
-      type: "write",
-      chunk,
-      index,
-      timestamp,
+    for (;;) {
+      if (this._closed || this._aborted) {
+        throw new Error("opfs-chunk-writer-closed");
+      }
+      try {
+        // An onerror between writes leaves no worker; recover before posting.
+        if (!this.worker && this._fileName && !this._dead) {
+          if (this._recoveries >= MAX_WRITER_RECOVERIES) {
+            this._markDead(new Error("opfs-worker-missing"));
+            throw this._deathError;
+          }
+          await this._recover(new Error("opfs-worker-missing"));
+        }
+        const resp = await this._request({
+          type: "write",
+          chunk,
+          index,
+          timestamp,
+        });
+        this._byteSize = resp.totalSize ?? this._byteSize;
+        this._chunkCount += 1;
+        this._healthyWrites += 1;
+        if (
+          this._recoveries > 0 &&
+          this._healthyWrites >= HEALTHY_WRITES_TO_REFILL
+        ) {
+          this._recoveries = 0;
+        }
+        return;
+      } catch (err) {
+        if (this._dead || !this._isRecoverable(err)) throw err;
+        if (this._recoveries >= MAX_WRITER_RECOVERIES) {
+          this._markDead(err);
+          throw this._deathError;
+        }
+        await this._recover(err);
+      }
+    }
+  }
+
+  // Replace the worker and resume at the last acknowledged byte. The retried
+  // write then lands exactly where the failed one started.
+  async _recover(cause) {
+    if (this._closed || this._aborted) {
+      throw new Error("opfs-chunk-writer-closed");
+    }
+    this._recoveries += 1;
+    this._healthyWrites = 0;
+    opfsDiag("recovering", {
+      attempt: this._recoveries,
+      cause: String(cause?.message || cause).slice(0, 120),
+      fileName: this._fileName,
+      ackedBytes: this._byteSize,
     });
-    this._byteSize = resp.totalSize ?? this._byteSize;
-    this._chunkCount += 1;
+    this._abandonWorker(cause);
+    this._attachWorker();
+    try {
+      await this._request(
+        { type: "reopen", fileName: this._fileName, at: this._byteSize },
+        OPEN_TIMEOUT_MS,
+      );
+    } catch (err) {
+      this._markDead(err);
+      throw this._deathError;
+    }
+    if (this._closed || this._aborted) {
+      // close()/abort() raced the reopen; don't leave a second handle open.
+      this._teardown();
+      throw new Error("opfs-chunk-writer-closed");
+    }
+    opfsDiag("recovered", {
+      attempt: this._recoveries,
+      ackedBytes: this._byteSize,
+    });
   }
 
   async close() {
@@ -190,7 +300,7 @@ export class OpfsChunkWriter {
       const resp = await this._request({ type: "close" }, closeTimeoutMs);
       const tAfterReq = (typeof performance !== "undefined" ? performance.now() : Date.now());
       this._byteSize = resp.byteSize ?? this._byteSize;
-      this._chunkCount = resp.chunkCount ?? this._chunkCount;
+      this._chunkCount = Math.max(this._chunkCount, resp.chunkCount ?? 0);
       this._fileName = resp.fileName || this._fileName;
       // Surface per-phase timings so a diag can attribute the 10s
       // close-stall we've seen on macOS: flush vs handle.close vs
@@ -277,6 +387,11 @@ export class OpfsChunkWriter {
         this.worker.terminate();
       } catch {}
       this.worker = null;
+    }
+    const closedErr = new Error("opfs-chunk-writer-closed");
+    for (const [, entry] of this.pending) {
+      if (entry.timeoutId) clearTimeout(entry.timeoutId);
+      entry.reject(closedErr);
     }
     this.pending.clear();
   }

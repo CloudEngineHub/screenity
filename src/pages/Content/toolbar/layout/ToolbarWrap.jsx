@@ -318,16 +318,36 @@ const ToolbarWrap = () => {
   useEffect(() => {
     if (!contentState.openToast) return;
     if (contentState.drawingMode) {
-      contentState.openToast(chrome.i18n.getMessage("drawingModeToast"), () => {
-        setMode("");
-      });
+      contentState.openToast(
+        chrome.i18n.getMessage("drawingModeToast"),
+        () => {
+          setMode("");
+        },
+        undefined,
+        { quietWhileRecording: true },
+      );
     }
     if (contentState.blurMode) {
-      contentState.openToast(chrome.i18n.getMessage("blurModeToast"), () => {
-        setMode("");
-      });
+      contentState.openToast(
+        chrome.i18n.getMessage("blurModeToast"),
+        () => {
+          setMode("");
+        },
+        undefined,
+        { quietWhileRecording: true },
+      );
     }
   }, [contentState.drawingMode, contentState.blurMode, contentState.openToast]);
+
+  // The toast carried the Esc shortcut, and it is hidden while recording.
+  useEffect(() => {
+    if (!contentState.drawingMode && !contentState.blurMode) return;
+    const onKeyDown = (e) => {
+      if (e.key === "Escape") setMode("");
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [contentState.drawingMode, contentState.blurMode]);
 
   useEffect(() => {
     if (contentState.drawingMode) setMode("draw");
@@ -456,14 +476,12 @@ const ToolbarWrap = () => {
                     hideToolbar: true,
                     drawingMode: false,
                     blurMode: false,
-                    hideUIAlerts: false,
                     toolbarHover: false,
                     hideUI: true,
                   }));
 
                   chrome.storage.local.set({
                     hideToolbar: true,
-                    hideUIAlerts: false,
                     toolbarHover: false,
                     hideUI: true,
                   });

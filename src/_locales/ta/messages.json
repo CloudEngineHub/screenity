@@ -839,10 +839,6 @@
     "message": "மைக்ரோஃபோன் முடக்கப்பட்டுள்ளது",
     "description": "மைக்ரோஃபோன் முடக்கப்பட்டுள்ளது விளக்க தலைப்பு"
   },
-  "hideUIAlerts": {
-    "message": "UI அறிவிப்புகளை மறை",
-    "description": "UI அறிவிப்புகளை மறைக்க பொது பொது"
-  },
   "noShowAgain": {
     "message": "மீண்டும் காட்ட விரும்பாதே",
     "description": "மீண்டும் காட்ட விரும்பாதே பொது"
@@ -2056,5 +2052,13 @@
   "teleprompterRegionStartOnPage": {
     "message": "பகுதி பதிவை பக்கத்திலிருந்தே தொடங்க வேண்டும்",
     "description": "Tooltip on the disabled Start button in the floating teleprompter window when recording a region, which can only be started from the page"
+  },
+  "sandboxEditorSelectionPendingHint": {
+    "message": "முதலில் உங்கள் தேர்வைப் பயன்படுத்த குறை அல்லது பிளவு பயன்படுத்தவும்.",
+    "description": "Tooltip on the disabled save button while trim handles are moved but no edit has been applied"
+  },
+  "sandboxEditorAudioPendingHint": {
+    "message": "மாற்றங்களை சேமிக்க முதலில் ஒரு ஆடியோ கோப்பைச் சேர்க்கவும்.",
+    "description": "Tooltip on the disabled save button in the audio editor until an audio file is added"
   }
 }

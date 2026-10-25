@@ -839,10 +839,6 @@
     "message": "Microfon desactivat",
     "description": "Títol del missatge emergent amb el microfon deshabilitat"
   },
-  "hideUIAlerts": {
-    "message": "Amaga les notificacions d'eines",
-    "description": "Botó per amagar les alertes de la interfície"
-  },
   "noShowAgain": {
     "message": "No tornis a mostrar",
     "description": "Botó de no tornis a mostrar"
@@ -2056,5 +2052,13 @@
   "teleprompterRegionStartOnPage": {
     "message": "L'enregistrament d'una regió s'ha d'iniciar des de la pàgina",
     "description": "Tooltip on the disabled Start button in the floating teleprompter window when recording a region, which can only be started from the page"
+  },
+  "sandboxEditorSelectionPendingHint": {
+    "message": "Fes servir Retalla o Elimina per aplicar primer la selecció.",
+    "description": "Tooltip on the disabled save button while trim handles are moved but no edit has been applied"
+  },
+  "sandboxEditorAudioPendingHint": {
+    "message": "Afegeix primer un fitxer d'àudio per desar els canvis.",
+    "description": "Tooltip on the disabled save button in the audio editor until an audio file is added"
   }
 }

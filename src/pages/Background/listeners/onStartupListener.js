@@ -7,6 +7,7 @@ const CLOUD_FEATURES_ENABLED =
 // For some reason without this the service worker doesn't always work
 export const onStartupListener = async () => {
   chrome.runtime.onStartup.addListener(() => {
+    chrome.storage.local.remove(["cameraPipTab", "prompterScriptTab"]).catch(() => {});
     if (globalThis.SCREENITY_VERBOSE_LOGS) {
       console.log("Service worker started up successfully.");
     }

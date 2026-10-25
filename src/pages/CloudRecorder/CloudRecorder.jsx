@@ -184,6 +184,7 @@ const deferFinalizeHostAllowed = () =>
   (!IS_IFRAME_CONTEXT &&
     typeof window !== "undefined" &&
     window.SCREENITY_DEFER_FINALIZE_ON_TAB === true);
+const LOCAL_CHUNK_WRITE_TIMEOUT_MS = 10000;
 const SCREEN_CHUNK_MEMORY_WINDOW = 8;
 const CAMERA_CHUNK_MEMORY_WINDOW = 8;
 const AUDIO_CHUNK_MEMORY_WINDOW = 8;
@@ -402,6 +403,7 @@ const CloudRecorder = () => {
 
   const isRestarting = useRef(false);
   const isFinishing = useRef(false);
+  const stopPromiseRef = useRef(null);
   // Re-entry guard for setMic()'s lazy acquire branch (see Recorder.jsx).
   const isLazyAcquiringMic = useRef(false);
   // Latest mic-toggle intent so a mid-acquire toggle-off is honored.
@@ -1340,7 +1342,7 @@ const CloudRecorder = () => {
           d.visibility?.changes ?? "?"
         } q=${d.peakEncodeQueueSize?.video ?? "?"} drop=${
           d.droppedForBackpressure?.video ?? "?"
-        } n=${name} m=${message}`,
+        } dec=${String(d.decision || "?").slice(0, 45)} n=${name} m=${message}`,
       });
     } catch {}
   };
@@ -5069,7 +5071,17 @@ const CloudRecorder = () => {
     // Pre-flight OPFS quota; otherwise we start and checkMaxMemory
     // stops us within ~1s of the first chunk.
     try {
-      const { quota = 0, usage = 0 } = await navigator.storage.estimate();
+      // Bounded so a hung estimate can't wedge the start.
+      let estimateTimer = null;
+      const { quota = 0, usage = 0 } = await Promise.race([
+        navigator.storage.estimate(),
+        new Promise((_, reject) => {
+          estimateTimer = setTimeout(
+            () => reject(new Error("storage-estimate-timeout")),
+            5000,
+          );
+        }),
+      ]).finally(() => clearTimeout(estimateTimer));
       const headroom = Math.max(0, quota - usage);
       const minQuota = 25 * 1024 * 1024;
       if (quota > 0 && quota < minQuota) {
@@ -5523,20 +5535,33 @@ const CloudRecorder = () => {
             index.current++;
 
             const writeStartedAt = performance.now();
-            await chunksStore
-              .setItem(`chunk_${chunkIndex}`, {
-                index: chunkIndex,
-                chunk: blob,
-                timestamp,
-              })
-              .catch((err) => {
-                fatalErrorRef.current = true;
-                sendRecordingError(
-                  "Could not buffer recording data locally (IndexedDB blocked)."
-                );
-                sendStopRecording();
-                throw err;
+            let localWriteOk = true;
+            let localWriteTimer = null;
+            try {
+              await Promise.race([
+                chunksStore.setItem(`chunk_${chunkIndex}`, {
+                  index: chunkIndex,
+                  chunk: blob,
+                  timestamp,
+                }),
+                new Promise((_, reject) => {
+                  localWriteTimer = setTimeout(
+                    () => reject(new Error("local-chunk-write-timeout")),
+                    LOCAL_CHUNK_WRITE_TIMEOUT_MS
+                  );
+                }),
+              ]);
+            } catch (err) {
+              localWriteOk = false;
+              console.warn("Failed to persist screen chunk locally:", err);
+              void emitUploadTelemetry("upload_local_backup_degraded", {
+                backupType: "screen",
+                reason: "screen-idb-write-failed",
+                error: err?.message || String(err),
               });
+            } finally {
+              clearTimeout(localWriteTimer);
+            }
             const writeMs = performance.now() - writeStartedAt;
             const writeStats = localWriteStatsRef.current;
             writeStats.count += 1;
@@ -5544,13 +5569,15 @@ const CloudRecorder = () => {
             if (writeMs > writeStats.maxMs) writeStats.maxMs = writeMs;
             if (writeMs >= 1000) writeStats.slowCount += 1;
 
-            patchTrackState("screen", {
-              durableChunkCount: chunkIndex + 1,
-              lastPersistedChunkIndex: chunkIndex,
-              lastPersistedAt: timestamp,
-            });
+            if (localWriteOk) {
+              patchTrackState("screen", {
+                durableChunkCount: chunkIndex + 1,
+                lastPersistedChunkIndex: chunkIndex,
+                lastPersistedAt: timestamp,
+              });
 
-            requestSessionPersist({ lastChunkIndex: chunkIndex });
+              requestSessionPersist({ lastChunkIndex: chunkIndex });
+            }
 
             if (uploadersInitialized.current && screenUploader.current) {
               try {
@@ -7140,8 +7167,14 @@ const CloudRecorder = () => {
     return avg < silenceThreshold;
   };
 
-  const stopRecording = async (shouldFinalize = true, reason = "unknown") => {
-    if (isFinishing.current || sentLast.current) return;
+  const stopRecording = (shouldFinalize = true, reason = "unknown") => {
+    if (isFinishing.current || sentLast.current) return Promise.resolve();
+    const run = runStopRecording(shouldFinalize, reason);
+    stopPromiseRef.current = run;
+    return run;
+  };
+
+  const runStopRecording = async (shouldFinalize, reason) => {
     // Lock immediately: prevents duplicate stop/finalize races under unload pressure.
     isFinishing.current = true;
     clearPendingStart();
@@ -10076,6 +10109,14 @@ const CloudRecorder = () => {
               request.shouldFinalize !== false,
               request.reason || "offscreen-shutdown"
             );
+          }
+          // An in-flight stop (e.g. the timer alarm) makes the call above a no-op;
+          // ack after its finalize, within the timeout.
+          if (request.shouldFinalize !== false && stopPromiseRef.current) {
+            await Promise.race([
+              stopPromiseRef.current.catch(() => {}),
+              new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+            ]);
           }
           // Don't stop capture tracks here: it raced a slow start (isInit not
           // yet flipped, tracks live) and killed the capture mid-start.

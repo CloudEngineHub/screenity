@@ -839,10 +839,6 @@
     "message": "마이크 비활성화됨",
     "description": "Microphone disabled toast title"
   },
-  "hideUIAlerts": {
-    "message": "UI 알림 숨기기",
-    "description": "Hide UI alerts button"
-  },
   "noShowAgain": {
     "message": "다시 표시하지 않음",
     "description": "Don't show again button"
@@ -2056,5 +2052,13 @@
   "teleprompterRegionStartOnPage": {
     "message": "영역 녹화는 페이지에서 시작해야 합니다",
     "description": "Tooltip on the disabled Start button in the floating teleprompter window when recording a region, which can only be started from the page"
+  },
+  "sandboxEditorSelectionPendingHint": {
+    "message": "먼저 자르기를 사용해 선택 영역을 적용하세요.",
+    "description": "Tooltip on the disabled save button while trim handles are moved but no edit has been applied"
+  },
+  "sandboxEditorAudioPendingHint": {
+    "message": "변경 사항을 저장하려면 먼저 오디오 파일을 추가하세요.",
+    "description": "Tooltip on the disabled save button in the audio editor until an audio file is added"
   }
 }

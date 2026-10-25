@@ -839,10 +839,6 @@
     "message": "Мікрофон вимкнено",
     "description": "Microphone disabled toast title"
   },
-  "hideUIAlerts": {
-    "message": "Приховати сповіщення інтерфейсу",
-    "description": "Hide UI alerts button"
-  },
   "noShowAgain": {
     "message": "Не показувати знову",
     "description": "Don't show again button"
@@ -2054,5 +2050,13 @@
   "teleprompterRegionStartOnPage": {
     "message": "Запис області потрібно починати зі сторінки",
     "description": "Tooltip on the disabled Start button in the floating teleprompter window when recording a region, which can only be started from the page"
+  },
+  "sandboxEditorSelectionPendingHint": {
+    "message": "Спочатку застосуйте виділення кнопкою «Обрізати» або «Вирізати».",
+    "description": "Tooltip on the disabled save button while trim handles are moved but no edit has been applied"
+  },
+  "sandboxEditorAudioPendingHint": {
+    "message": "Щоб зберегти зміни, спочатку додайте аудіофайл.",
+    "description": "Tooltip on the disabled save button in the audio editor until an audio file is added"
   }
 }

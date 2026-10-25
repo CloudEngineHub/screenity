@@ -1,6 +1,8 @@
 import { focusTab } from "./focusTab";
 import { sendMessageTab } from "./sendMessageTab";
 import { startRecording } from "../recording/startRecording";
+import { waitForPrompterGate } from "./waitForPrompterGate";
+import { waitForPopupHidden } from "./waitForPopupHidden";
 import { getCurrentTab } from "./getCurrentTab";
 import { traceStep } from "../../utils/startFlowTrace";
 import { perfMark, perfSpan } from "../../utils/perfMarks";
@@ -15,11 +17,14 @@ export const restartActiveTab = async (message = {}) => {
     const currentTab = await getCurrentTab();
     const targetTabId = preferredTabId || currentTab?.id || null;
     if (targetTabId) {
+      const sentAt = Date.now();
       sendMessageTab(targetTabId, { type: "ready-to-record" });
 
       const { countdown } = await chrome.storage.local.get(["countdown"]);
 
       if (!countdown) {
+        await waitForPrompterGate(targetTabId, sentAt);
+        await waitForPopupHidden(sentAt);
         startRecording("restartActiveTab-no-countdown");
       }
     } else {
@@ -116,11 +121,14 @@ export const resetActiveTab = async (forceRestart = false, message = {}) => {
 
       if (targetTabId) {
         perfMark("BG.resetActiveTab ready-to-record.sent", { targetTabId });
+        const sentAt = Date.now();
         sendMessageTab(targetTabId, { type: "ready-to-record" }).catch(() => {});
 
         const { countdown } = await chrome.storage.local.get(["countdown"]);
 
         if (!countdown) {
+          await waitForPrompterGate(targetTabId, sentAt);
+          await waitForPopupHidden(sentAt);
           startRecording("resetActiveTab-no-countdown", { storedCountdown: countdown });
         }
       } else {

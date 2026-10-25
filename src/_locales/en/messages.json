@@ -435,6 +435,14 @@
     "message": "Save changes",
     "description": "Save button in sandbox editor page"
   },
+  "sandboxEditorSelectionPendingHint": {
+    "message": "Use Trim or Cut to apply your selection first.",
+    "description": "Tooltip on the disabled save button while trim handles are moved but no edit has been applied"
+  },
+  "sandboxEditorAudioPendingHint": {
+    "message": "Add an audio file first to save changes.",
+    "description": "Tooltip on the disabled save button in the audio editor until an audio file is added"
+  },
   "sandboxEditorSaveProgressButton": {
     "message": "Saving...",
     "description": "Save button in sandbox editor page while saving"
@@ -838,10 +846,6 @@
   "micOffToast": {
     "message": "Microphone disabled",
     "description": "Microphone disabled toast title"
-  },
-  "hideUIAlerts": {
-    "message": "Hide UI notifications",
-    "description": "Hide UI alerts button"
   },
   "noShowAgain": {
     "message": "Don't show again",

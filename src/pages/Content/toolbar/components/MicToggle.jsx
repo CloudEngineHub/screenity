@@ -53,7 +53,9 @@ const MicToggle = (props) => {
               pressed
                 ? chrome.i18n.getMessage("micOnToast")
                 : chrome.i18n.getMessage("micOffToast"),
-              () => {}
+              () => {},
+              undefined,
+              { quietWhileRecording: true }
             );
           }}
         >

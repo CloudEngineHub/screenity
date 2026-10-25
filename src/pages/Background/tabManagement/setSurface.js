@@ -12,15 +12,16 @@ export const setSurface = async (request) => {
   } catch (err) {
     console.warn("[Screenity][BG] setSurface auth refresh failed:", err);
   }
-  const { activeTab, isSubscribed, instantMode, recordingType } =
+  const { activeTab, isSubscribed, instantMode, recordingType, cameraPipTab } =
     await chrome.storage.local.get([
       "activeTab",
       "isSubscribed",
       "instantMode",
       "recordingType",
+      "cameraPipTab",
     ]);
 
-  sendMessageTab(activeTab, {
+  const message = {
     type: "set-surface",
     surface: request.surface,
     // A region/tab capture still reports displaySurface "monitor". Without this
@@ -28,5 +29,11 @@ export const setSurface = async (request) => {
     recordingType: recordingType || null,
     subscribed: result ? Boolean(result.subscribed) : Boolean(isSubscribed),
     instantMode: result ? Boolean(result.instantMode) : Boolean(instantMode),
-  });
+  };
+  sendMessageTab(activeTab, message);
+  // The floating camera belongs to the tab that opened it, which may no longer
+  // be the active one; it decides whether the new capture still fits.
+  if (cameraPipTab != null && cameraPipTab !== activeTab) {
+    sendMessageTab(cameraPipTab, message)?.catch?.(() => {});
+  }
 };

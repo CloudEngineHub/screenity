@@ -839,10 +839,6 @@
     "message": "麥克風已停用",
     "description": "Microphone disabled toast title"
   },
-  "hideUIAlerts": {
-    "message": "隱藏介面內通知",
-    "description": "Hide UI alerts button"
-  },
   "noShowAgain": {
     "message": "不要再顯示",
     "description": "Don't show again button"
@@ -2056,5 +2052,13 @@
   "teleprompterRegionStartOnPage": {
     "message": "區域錄製必須從頁面開始",
     "description": "Tooltip on the disabled Start button in the floating teleprompter window when recording a region, which can only be started from the page"
+  },
+  "sandboxEditorSelectionPendingHint": {
+    "message": "請先使用「修剪」或「分割」套用所選範圍。",
+    "description": "Tooltip on the disabled save button while trim handles are moved but no edit has been applied"
+  },
+  "sandboxEditorAudioPendingHint": {
+    "message": "請先新增音訊檔案，再儲存變更。",
+    "description": "Tooltip on the disabled save button in the audio editor until an audio file is added"
   }
 }

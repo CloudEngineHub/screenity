@@ -21,7 +21,11 @@ import {
   normalizeSettings,
   shouldClosePrompter,
 } from "./prompterRules";
-import { notifyPrompterClosed, startCameraCloseNotice } from "./prompterGate";
+import {
+  giveWindowToCamera,
+  notifyPrompterClosed,
+  startCameraCloseNotice,
+} from "./prompterGate";
 import { loadPrompterSettings, savePrompterSettings } from "./prompterSettings";
 import {
   closePipLayer,
@@ -37,6 +41,51 @@ import {
 const SAVE_DELAY_MS = 400;
 const CLOUD_FEATURES_ENABLED =
   process.env.SCREENITY_ENABLE_CLOUD_FEATURES === "true";
+
+// Publishes this tab's id under `key` while `active`; removes it on exit only if
+// still ours, since another tab's window may have replaced this one (Chrome
+// keeps a single floating window).
+const usePublishedTab = (key, active) => {
+  const publishedRef = useRef(null);
+  const clear = useCallback(() => {
+    const mine = publishedRef.current;
+    if (mine == null) return;
+    publishedRef.current = null;
+    try {
+      chrome.storage.local
+        .get(key)
+        .then((stored) => {
+          if (stored?.[key] === mine) return chrome.storage.local.remove(key);
+        })
+        .catch(() => {});
+    } catch {}
+  }, [key]);
+  useEffect(() => {
+    let cancelled = false;
+    if (active) {
+      chrome.runtime
+        .sendMessage({ type: "get-tab-id" })
+        .then((res) => {
+          if (cancelled || res?.tabId == null) return;
+          publishedRef.current = res.tabId;
+          chrome.storage.local.set({ [key]: res.tabId });
+        })
+        .catch(() => {});
+    } else {
+      clear();
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [active, key, clear]);
+  useEffect(() => {
+    window.addEventListener("pagehide", clear);
+    return () => {
+      window.removeEventListener("pagehide", clear);
+      clear();
+    };
+  }, [clear]);
+};
 
 // Always mounted. Owns the floating window once the popup opens it and ties it
 // to the recording: scrolls with the take, stops on pause, closes if the capture includes it.
@@ -192,6 +241,12 @@ const TeleprompterController = () => {
   // Hiding the camera in the window moves it to the page, bubble included, even
   // where it is normally hidden during a recording.
   const cameraShown = cameraOn && settings?.showCamera !== false;
+
+  // Other tabs can't see this window, so their page bubble would double the camera in it.
+  // Wait for settings: they decide whether the camera is really in the window.
+  usePublishedTab("cameraPipTab", cameraShown && settings !== null);
+  // The background holds a no-countdown start until the gate has closed this.
+  usePublishedTab("prompterScriptTab", prompterOn || controlsOn);
   useEffect(() => {
     const onPage = cameraOn && !cameraShown;
     setContentState((prev) =>
@@ -221,7 +276,6 @@ const TeleprompterController = () => {
         recordingType: message.recordingType || null,
         surface: message.surface,
         layers: getPipLayers(),
-        keepVisible: getPrompterKeepVisible(),
         cameraEnabled:
           Boolean(state.cameraActive) && state.defaultVideoInput !== "none",
         windowOpen: Boolean(getPrompterWindow()),
@@ -259,8 +313,18 @@ const TeleprompterController = () => {
         })
       ) {
         if (getPipLayers().prompter) void notifyPrompterClosed(state);
-        closePipLayer("prompter", "capture records the window");
-        closePipLayer("controls", "capture records the window");
+        // The camera has to be in the window before the script leaves it, or the window closes.
+        giveWindowToCamera({
+          ...state,
+          isSubscribed: Boolean(message.subscribed),
+          instantMode: Boolean(message.instantMode),
+          recordingType: message.recordingType || state.recordingType,
+        })
+          .catch(() => {})
+          .finally(() => {
+            closePipLayer("prompter", "capture records the window");
+            closePipLayer("controls", "capture records the window");
+          });
       }
     };
     chrome.runtime.onMessage.addListener(onRuntime);
@@ -472,7 +536,9 @@ const TeleprompterController = () => {
     });
     contentState.openToast?.(
       chrome.i18n.getMessage(pressed ? "micOnToast" : "micOffToast"),
-      () => {}
+      () => {},
+      undefined,
+      { quietWhileRecording: true }
     );
   };
 

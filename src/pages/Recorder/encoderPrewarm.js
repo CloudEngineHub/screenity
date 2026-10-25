@@ -23,6 +23,22 @@ import {
 } from "./webcodecs/startupFlags";
 
 let _activeWarmer = null;
+let _lastHwError = null;
+const PREWARM_HW_ERROR_TTL_MS = 60_000;
+
+// An explicit hardware-encoder error from the prewarm, if recent. Only an
+// error counts: a prewarm that merely ended with no chunks is not evidence.
+export const getRecentPrewarmHwError = ({ width, height } = {}) => {
+  if (!_lastHwError) return null;
+  if (_lastHwError.width !== width || _lastHwError.height !== height) {
+    return null;
+  }
+  if (performance.now() - _lastHwError.at > PREWARM_HW_ERROR_TTL_MS) {
+    _lastHwError = null;
+    return null;
+  }
+  return _lastHwError.name;
+};
 
 const computeFramerate = (config) => {
   const fps = Number(config?.framerate);
@@ -167,6 +183,7 @@ export const startEncoderPrewarm = async (cfg) => {
     state.encoder = new VideoEncoder({
       output: (chunk, meta) => {
         state.chunks += 1;
+        _lastHwError = null;
         if (!state.warmDecoderConfig && meta?.decoderConfig) {
           state.warmDecoderConfig = meta.decoderConfig;
         }
@@ -177,6 +194,12 @@ export const startEncoderPrewarm = async (cfg) => {
           state.errorSink(err);
           return;
         }
+        _lastHwError = {
+          at: performance.now(),
+          name: String(err?.name || "error").slice(0, 40),
+          width: cfg.width,
+          height: cfg.height,
+        };
         perfMark("Recorder.encoderPrewarm.encoderError", {
           msg: String(err?.message || err).slice(0, 120),
         });
@@ -214,8 +237,12 @@ export const startEncoderPrewarm = async (cfg) => {
           i === 0,
         );
       }
+      // close() drops queued frames, so close before the flush lands warms nothing.
       try {
-        state.encoder.flush().catch(() => {});
+        await Promise.race([
+          state.encoder.flush().catch(() => {}),
+          new Promise((resolve) => setTimeout(resolve, 1500)),
+        ]);
       } catch {}
       await handle.close();
       endStart({ chunks: state.chunks, ok: state.chunks > 0, mode: "burst" });

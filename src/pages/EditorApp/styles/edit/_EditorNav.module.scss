@@ -67,3 +67,19 @@
     display: none;
   }
 }
+
+.saveWrap {
+  display: inline-flex;
+}
+.tooltip {
+  max-width: 240px;
+  padding: 8px 13px;
+  border-radius: 12px;
+  background-color: $color-text-primary;
+  color: $color-text-contrast;
+  font-family: $font-medium;
+  font-size: 12px;
+  line-height: 1.4;
+  user-select: none;
+  z-index: $z-index-max;
+}

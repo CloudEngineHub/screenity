@@ -245,11 +245,14 @@ export const handleAlarm = async (alarm) => {
   }
 
   if (alarm.name === "recording-alarm") {
-    const { recording } = await chrome.storage.local.get(["recording"]);
+    const { recording, isSubscribed, offscreen } =
+      await chrome.storage.local.get(["recording", "isSubscribed", "offscreen"]);
 
     if (recording) {
       diagEvent("alarm-fired");
-      stopRecording();
+      // Cloud or offscreen: a BG stopRecording() closes the recorder doc mid-finalize.
+      // The recorder stops itself via video-ready, same as a toolbar stop.
+      if (!isSubscribed && !offscreen) stopRecording();
       sendMessageRecord({ type: "stop-recording-tab" });
       await handleTabMessaging(null);
     }

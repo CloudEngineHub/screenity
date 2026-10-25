@@ -6,9 +6,9 @@ import { ContentStateContext } from "../../context/ContentState"; // Import the 
 const VideoPlayer = (props) => {
   const [contentState, setContentState] = useContext(ContentStateContext); // Access the ContentState context
   const playerRef = useRef(null);
+  const wrapRef = useRef(null);
   const [url, setUrl] = useState(null);
   const [source, setSource] = useState(null);
-  const [isSet, setIsSet] = useState(false);
   // Probed from the blob's intrinsic dimensions; a fixed "16:9" would
   // pillarbox recordings of square-ish tabs.
   const [videoRatio, setVideoRatio] = useState("16:9");
@@ -97,62 +97,28 @@ const VideoPlayer = (props) => {
     }
   }, [contentState.blob, playerRef]);
 
+  // Media events don't bubble but can be captured, so one listener on the
+  // wrapper survives plyr-react rebuilding the Plyr (and its <video>) on every
+  // source change.
   useEffect(() => {
-    if (playerRef.current && playerRef.current.plyr) {
-      // Check when the video is playing, update the time in real time
-      playerRef.current.plyr.on("timeupdate", () => {
-        setContentState((prevContentState) => ({
-          ...prevContentState,
-          time: playerRef.current.plyr.currentTime,
-          updatePlayerTime: false,
-        }));
-      });
-    }
-
-    return () => {
-      if (playerRef.current && playerRef.current.plyr) {
-        playerRef.current.plyr.off("timeupdate");
-      }
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const onTimeUpdate = (e) => {
+      if (e.target?.tagName !== "VIDEO") return;
+      const time = e.target.currentTime;
+      setContentState((prevContentState) => ({
+        ...prevContentState,
+        time,
+        updatePlayerTime: false,
+      }));
     };
-  }, [playerRef]);
-
-  const handleClick = () => {
-    if (isSet) return;
-    if (playerRef.current && playerRef.current.plyr) {
-      setIsSet(true);
-      playerRef.current.plyr.on("timeupdate", () => {
-        setContentState((prevContentState) => ({
-          ...prevContentState,
-          time: playerRef.current.plyr.currentTime,
-          updatePlayerTime: false,
-        }));
-      });
-    }
-  };
-
-  useEffect(() => {
-    if (isSet) return;
-    const handleKeyPress = (event) => {
-      if (playerRef.current && playerRef.current.plyr) {
-        setIsSet(true);
-        playerRef.current.plyr.on("timeupdate", () => {
-          setContentState((prevContentState) => ({
-            ...prevContentState,
-            time: playerRef.current.plyr.currentTime,
-            updatePlayerTime: false,
-          }));
-        });
-      }
-    };
-    window.addEventListener("keydown", handleKeyPress);
-    return () => {
-      window.removeEventListener("keydown", handleKeyPress);
-    };
-  }, [isSet]);
+    wrap.addEventListener("timeupdate", onTimeUpdate, true);
+    return () => wrap.removeEventListener("timeupdate", onTimeUpdate, true);
+  }, []);
 
   return (
     <div className="videoPlayer">
-      <div className="playerWrap" onClick={handleClick}>
+      <div className="playerWrap" ref={wrapRef}>
         {url && (
           <Plyr
             ref={playerRef}

@@ -9,6 +9,8 @@ import React, {
 
 import { updateFromStorage } from "./utils/updateFromStorage";
 import { shouldResendCropTarget } from "./cropTargetGate";
+import { cameraPipOnOtherTab } from "../teleprompter/prompterRules";
+import { getPrompterWindow } from "../teleprompter/prompterWindow";
 import { lifecycle } from "../../utils/lifecycleLog";
 import { perfMark, perfReset } from "../../utils/perfMarks";
 
@@ -94,6 +96,8 @@ const ContentState = (props) => {
   };
   const suppressStartBeepRef = useRef(false);
   const tabIdRef = useRef(null);
+  const cameraPipTabRef = useRef(null);
+  const restartingFlagRef = useRef(false);
   const activeTabRef = useRef(null);
   const tabRecordedIdRef = useRef(null);
   const recordingUiTabRef = useRef(null);
@@ -166,6 +170,18 @@ const ContentState = (props) => {
     [isTargetTab]
   );
 
+  const recomputeCameraPipElsewhere = useCallback(() => {
+    const elsewhere = cameraPipOnOtherTab({
+      ownerTabId: cameraPipTabRef.current,
+      tabId: tabIdRef.current,
+    });
+    setContentState((prev) =>
+      prev.cameraPipElsewhere === elsewhere
+        ? prev
+        : { ...prev, cameraPipElsewhere: elsewhere }
+    );
+  }, []);
+
   const verifyUser = useCallback(async () => {
     if (!CLOUD_FEATURES_ENABLED) return;
     // Don't force a cookie-based re-login from the popup: a fresh install with
@@ -206,6 +222,7 @@ const ContentState = (props) => {
       if (response?.tabId !== undefined && response?.tabId !== null) {
         tabIdRef.current = response.tabId;
         recomputeRecordingUiAllowed("tab-id");
+        recomputeCameraPipElsewhere();
       }
     });
 
@@ -217,8 +234,11 @@ const ContentState = (props) => {
         "recordingStartTime",
         "recordingBeepTabId",
         "recordingNow",
+        "cameraPipTab",
       ],
       (result) => {
+        cameraPipTabRef.current = result.cameraPipTab ?? null;
+        recomputeCameraPipElsewhere();
         activeTabRef.current = result.activeTab ?? null;
         tabRecordedIdRef.current = result.tabRecordedID ?? null;
         recordingUiTabRef.current = result.recordingUiTabId ?? null;
@@ -227,7 +247,7 @@ const ContentState = (props) => {
         recomputeRecordingUiAllowed("storage-mount");
       }
     );
-  }, [recomputeRecordingUiAllowed]);
+  }, [recomputeRecordingUiAllowed, recomputeCameraPipElsewhere]);
 
   // Recompute the recording-UI scope on visibility/focus. Unlike
   // reconcileOnVisible (which bails during active recording), this runs during
@@ -237,14 +257,24 @@ const ContentState = (props) => {
   // runs before `contentState` is declared, so it must not reference it.
   useEffect(() => {
     recomputeRecordingUiAllowed("mount");
-    const onVisible = () => recomputeRecordingUiAllowed("visibility");
+    const onVisible = () => {
+      recomputeRecordingUiAllowed("visibility");
+      // Storage change events can be missed while a tab is in the background.
+      chrome.storage.local
+        .get("cameraPipTab")
+        .then((stored) => {
+          cameraPipTabRef.current = stored?.cameraPipTab ?? null;
+          recomputeCameraPipElsewhere();
+        })
+        .catch(() => {});
+    };
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", onVisible);
     return () => {
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onVisible);
     };
-  }, [recomputeRecordingUiAllowed]);
+  }, [recomputeRecordingUiAllowed, recomputeCameraPipElsewhere]);
 
   // Permissions-Policy camera=()/microphone=() surfaces as NotAllowedError, not a
   // real permission issue. This top-page probe misses feature=(self) (facebook.com);
@@ -979,6 +1009,8 @@ const ContentState = (props) => {
                   ? true
                   : false,
             });
+            // The start gate reads this before the new pick lands.
+            chrome.storage.local.remove("surface").catch(() => {});
             setContentState((prevContentState) => ({
               ...prevContentState,
 
@@ -1031,6 +1063,7 @@ const ContentState = (props) => {
             contentStateRef.current.recordingType === "camera" ? true : false,
         });
         traceStep("desktopCaptureSent");
+        chrome.storage.local.remove("surface").catch(() => {});
         setContentState((prevContentState) => ({
           ...prevContentState,
 
@@ -1421,6 +1454,7 @@ const ContentState = (props) => {
     isAddingImage: false,
     pipEnded: false,
     pipActive: false,
+    cameraPipElsewhere: false,
     tabCaptureFrame: false,
     showOnboardingArrow: false,
     offline: false,
@@ -1433,7 +1467,6 @@ const ContentState = (props) => {
     parentRef: null,
     shadowRef: null,
     settingsOpen: false,
-    hideUIAlerts: false,
     toolbarHover: false,
     hideUI: false,
     bigTab: "record",
@@ -1905,7 +1938,8 @@ const ContentState = (props) => {
     // hot tick never awaits IPC again.
     updateTimerFromStorage();
     const interval = setInterval(() => {
-      if (document.hidden) return;
+      // The floating window shows this clock, and stays visible when the tab is not.
+      if (document.hidden && !getPrompterWindow()) return;
       tickTimerFromRefs();
     }, 1000);
     const handleVisibility = () => {
@@ -1931,6 +1965,12 @@ const ContentState = (props) => {
   // recording has fully stopped elsewhere. Without this, Wrapper.jsx's
   // 800ms post-stop loader timer fires on the next hide→show
   // transition and the "Preparing..." overlay appears.
+  const pendingSinceRef = useRef(0);
+  useEffect(() => {
+    if (!contentState.pendingRecording) pendingSinceRef.current = 0;
+    else if (!pendingSinceRef.current) pendingSinceRef.current = Date.now();
+  }, [contentState.pendingRecording]);
+
   useEffect(() => {
     const reconcileOnVisible = async () => {
       if (document.hidden) return;
@@ -1938,8 +1978,18 @@ const ContentState = (props) => {
         const snap = await chrome.storage.local.get([
           "recording",
           "restarting",
+          "pendingRecording",
         ]);
         if (snap.recording || snap.restarting) return;
+        // Closing the picker refocuses the tab mid-start; resetting the button
+        // then invites a second click. Stuck-start timers still cover a real hang.
+        if (
+          snap.pendingRecording &&
+          pendingSinceRef.current &&
+          Date.now() - pendingSinceRef.current < 60000
+        ) {
+          return;
+        }
         setContentState((prev) =>
           prev.finalizingRecording ||
           prev.preparingRecording ||
@@ -2044,6 +2094,13 @@ const ContentState = (props) => {
       if (changes.recordingUiTabId) {
         recordingUiTabRef.current = changes.recordingUiTabId.newValue ?? null;
       }
+      if (changes.restarting) {
+        restartingFlagRef.current = Boolean(changes.restarting.newValue);
+      }
+      if (changes.cameraPipTab) {
+        cameraPipTabRef.current = changes.cameraPipTab.newValue ?? null;
+        recomputeCameraPipElsewhere();
+      }
       if (changes.recordingStartTime) {
         recordingStartTimeRef.current =
           changes.recordingStartTime.newValue ?? null;
@@ -2081,7 +2138,10 @@ const ContentState = (props) => {
                   ...prev,
                   preparingRecording: false,
                   pendingRecording: false,
-                  restartingRecording: false,
+                  // A restart passes through "not recording"; its own flag ends it.
+                  restartingRecording: restartingFlagRef.current
+                    ? prev.restartingRecording
+                    : false,
                 }
               : prev
           );
@@ -2335,7 +2395,12 @@ const ContentState = (props) => {
 
     chrome.storage.onChanged.addListener(onChanged);
     return () => chrome.storage.onChanged.removeListener(onChanged);
-  }, [isTargetTab, updateTimerFromStorage, verifyUser]);
+  }, [
+    isTargetTab,
+    updateTimerFromStorage,
+    verifyUser,
+    recomputeCameraPipElsewhere,
+  ]);
 
   useEffect(() => {
     if (!contentState.customRegion) {
@@ -2487,7 +2552,6 @@ const ContentState = (props) => {
     if (!contentState.hideUI) {
       setContentState((prevContentState) => ({
         ...prevContentState,
-        hideUIAlerts: false,
         hideToolbar: false,
         toolbarHover: false,
       }));

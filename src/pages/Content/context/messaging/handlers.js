@@ -11,6 +11,7 @@ import {
   abortStartGate,
   runPrompterStartGate,
 } from "../../teleprompter/prompterGate";
+import { getPrompterWindow } from "../../teleprompter/prompterWindow";
 import { traceStep, setStartFlowOutcome } from "../../../utils/startFlowTrace";
 import { perfMark } from "../../../utils/perfMarks";
 import { triggerSupportDownload } from "../../../utils/triggerSupportDownload";
@@ -631,13 +632,28 @@ export const setupHandlers = () => {
       preparingRecording: false,
       pendingRecording: true,
     }));
+    // Two frames: the popup is out of the capture only once it has painted away.
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        chrome.storage.local.set({ popupHiddenAt: Date.now() }).catch(() => {});
+      }),
+    );
 
     // Waits on the user's choice when the capture would record the teleprompter
     // window. No-op if it isn't open.
+    const hadScriptWindow = Boolean(getPrompterWindow());
     try {
       // Ended under the prompt (stop-pending, recording-error): no countdown.
       if ((await runPrompterStartGate(getState())) === ABORTED) return;
-    } catch {}
+    } catch {
+    } finally {
+      // With no countdown the background holds the start for this mark.
+      if (hadScriptWindow) {
+        chrome.storage.local
+          .set({ prompterGateDone: Date.now() })
+          .catch(() => {});
+      }
+    }
 
     // BG is source of truth; reading React default would race the user
     // setting and produce double beeps.
@@ -715,11 +731,10 @@ export const setupHandlers = () => {
       ...prev,
       hideUI: nextHideUI,
       hideToolbar: nextHideUI ? true : prev.hideToolbar,
-      hideUIAlerts: nextHideUI ? true : prev.hideUIAlerts,
     }));
     chrome.storage.local.set({
       hideUI: nextHideUI,
-      ...(nextHideUI ? { hideToolbar: true, hideUIAlerts: true } : {}),
+      ...(nextHideUI ? { hideToolbar: true } : {}),
     });
   });
 
@@ -756,7 +771,9 @@ export const setupHandlers = () => {
         nextActive
           ? chrome.i18n.getMessage("micOnToast")
           : chrome.i18n.getMessage("micOffToast"),
-        () => {}
+        () => {},
+        undefined,
+        { quietWhileRecording: true }
       );
     }
   });

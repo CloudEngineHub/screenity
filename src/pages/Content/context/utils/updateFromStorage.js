@@ -1,5 +1,6 @@
 import { setContentState } from "../ContentState";
 import { checkRecording } from "./checkRecording";
+import { migrateHideUIAlerts } from "./migrateHideUIAlerts";
 
 const CURSOR_EFFECTS = ["target", "highlight", "spotlight"];
 
@@ -77,8 +78,17 @@ export const updateFromStorage = (check = true, id = null) => {
       "wasLoggedIn",
       "instantMode",
       "hasSubscribedBefore",
+      "isSubscribed",
     ],
     (result) => {
+      const migration = migrateHideUIAlerts(result);
+      if (migration) {
+        chrome.storage.local.remove("hideUIAlerts");
+        if (migration.resetHideUI) {
+          chrome.storage.local.set({ hideUI: false });
+          result.hideUI = false;
+        }
+      }
       const storedEffects = normalizeCursorEffects(result.cursorEffects);
       const hasStoredEffects = Array.isArray(result.cursorEffects);
       const legacyMode =
@@ -251,10 +261,6 @@ export const updateFromStorage = (check = true, id = null) => {
           result.surface !== undefined && result.surface !== null
             ? result.surface
             : prevContentState.surface,
-        hideUIAlerts:
-          result.hideUIAlerts !== undefined && result.hideUIAlerts !== null
-            ? result.hideUIAlerts
-            : prevContentState.hideUIAlerts,
         hideUI:
           result.hideUI !== undefined && result.hideUI !== null
             ? result.hideUI
@@ -325,6 +331,13 @@ export const updateFromStorage = (check = true, id = null) => {
         instantMode: result.instantMode || false,
         onboarding: result.onboarding || false,
         hasSubscribedBefore: result.hasSubscribedBefore || false,
+        // Seeds a fresh tab only: until the auth check answers, a Pro bubble
+        // would show on a page loaded mid-recording. That check overrides it.
+        isSubscribed:
+          prevContentState.isSubscribed === undefined &&
+          typeof result.isSubscribed === "boolean"
+            ? result.isSubscribed
+            : prevContentState.isSubscribed,
         showProSplash: result.showProSplash || false,
       }));
 

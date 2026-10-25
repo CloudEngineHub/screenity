@@ -839,10 +839,6 @@
     "message": "Mikrofon wyłączony",
     "description": "Tytuł modalnego komunikatu o wyłączonym mikrofonie"
   },
-  "hideUIAlerts": {
-    "message": "Ukryj powiadomienia interfejsu",
-    "description": "Przycisk ukrywania alertów interfejsu"
-  },
   "noShowAgain": {
     "message": "Nie pokazuj ponownie",
     "description": "Przycisk nie pokazuj ponownie"
@@ -2056,5 +2052,13 @@
   "teleprompterRegionStartOnPage": {
     "message": "Nagrywanie obszaru trzeba rozpocząć ze strony",
     "description": "Tooltip on the disabled Start button in the floating teleprompter window when recording a region, which can only be started from the page"
+  },
+  "sandboxEditorSelectionPendingHint": {
+    "message": "Najpierw zastosuj zaznaczenie przyciskiem Przytnij lub Wycięcie.",
+    "description": "Tooltip on the disabled save button while trim handles are moved but no edit has been applied"
+  },
+  "sandboxEditorAudioPendingHint": {
+    "message": "Aby zapisać zmiany, najpierw dodaj plik audio.",
+    "description": "Tooltip on the disabled save button in the audio editor until an audio file is added"
   }
 }

@@ -5,8 +5,29 @@ import { isRecordingStartInFlight } from "../recording/startRecording";
 import { diagEvent, endDiagSession } from "../../utils/diagnosticLog";
 import { forgetRetained } from "../recording/recordingRetention";
 
+// The floating camera window dies with its tab, whether the tab closes,
+// navigates or is discarded, and a crashed page never gets to clear the flag.
+const clearCameraPipTab = async (tabId) => {
+  try {
+    const stored = await chrome.storage.local.get([
+      "cameraPipTab",
+      "prompterScriptTab",
+    ]);
+    const stale = ["cameraPipTab", "prompterScriptTab"].filter(
+      (key) => stored[key] === tabId
+    );
+    if (stale.length) await chrome.storage.local.remove(stale);
+  } catch {}
+};
+
 export const onTabRemovedListener = () => {
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (changeInfo.status === "loading" || changeInfo.discarded) {
+      clearCameraPipTab(tabId);
+    }
+  });
   chrome.tabs.onRemoved.addListener(async (tabId) => {
+    clearCameraPipTab(tabId);
     // Drops the protection only. The bytes stay until the next cleanup, so
     // closing a tab never destroys a recording on its own.
     forgetRetained(tabId).catch(() => {});

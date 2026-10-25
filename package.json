@@ -1,6 +1,6 @@
 {
   "name": "screenity",
-  "version": "4.7.1",
+  "version": "4.7.2",
   "description": "The free and privacy-friendly screen recorder with no sign in needed.",
   "scripts": {
     "build": "cross-env NODE_ENV=production node utils/build.js",
@@ -38,8 +38,8 @@
   },
   "dependencies": {
     "@babel/plugin-transform-react-jsx": "^7.27.1",
-    "@mediabunny/aac-encoder": "^1.56.0",
-    "@mediapipe/tasks-vision": "0.10.32",
+    "@mediabunny/aac-encoder": "^1.62.1",
+    "@mediapipe/tasks-vision": "1.1.1",
     "@radix-ui/react-alert-dialog": "^1.0.4",
     "@radix-ui/react-collapsible": "^1.0.2",
     "@radix-ui/react-dropdown-menu": "^2.0.6",
@@ -65,7 +65,7 @@
     "gif.js": "^0.2.0",
     "jszip": "^3.10.1",
     "localforage": "^1.10.0",
-    "mediabunny": "^1.56.0",
+    "mediabunny": "^1.62.1",
     "patch-package": "^8.0.0",
     "plyr": "3.7.8",
     "plyr-react": "^5.3.0",

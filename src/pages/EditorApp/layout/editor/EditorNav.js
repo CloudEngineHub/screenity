@@ -1,4 +1,5 @@
 import React, { useContext } from "react";
+import DisabledTip from "../../components/global/DisabledTip";
 import styles from "../../styles/edit/_EditorNav.module.scss";
 import { ContentStateContext } from "../../context/ContentState";
 
@@ -42,8 +43,18 @@ const EditorNav = () => {
     );
   };
 
+  const hasPendingSelection =
+    contentState.start !== 0 || contentState.end !== 1;
+
+  const hasEdits =
+    !contentState.backupBlob || contentState.blob !== contentState.backupBlob;
+
+  const saveBlocked = hasPendingSelection && !contentState.isFfmpegRunning;
+
   const saveChanges = async () => {
-    if (contentState.isFfmpegRunning) return;
+    if (contentState.isFfmpegRunning || hasPendingSelection || !hasEdits) {
+      return;
+    }
 
     setContentState((prev) => ({
       ...prev,
@@ -92,15 +103,22 @@ const EditorNav = () => {
             {chrome.i18n.getMessage("sandboxEditorRevertButton")}
           </button>
 
-          <button
-            className="button primaryButton"
-            onClick={saveChanges}
-            disabled={contentState.isFfmpegRunning}
+          <DisabledTip
+            active={saveBlocked}
+            content={chrome.i18n.getMessage("sandboxEditorSelectionPendingHint")}
           >
-            {contentState.reencoding
-              ? chrome.i18n.getMessage("sandboxEditorSaveProgressButton")
-              : chrome.i18n.getMessage("sandboxEditorSaveButton")}
-          </button>
+            <button
+              className="button primaryButton"
+              onClick={saveChanges}
+              disabled={
+                contentState.isFfmpegRunning || hasPendingSelection || !hasEdits
+              }
+            >
+              {contentState.reencoding
+                ? chrome.i18n.getMessage("sandboxEditorSaveProgressButton")
+                : chrome.i18n.getMessage("sandboxEditorSaveButton")}
+            </button>
+          </DisabledTip>
         </div>
       </div>
     </div>

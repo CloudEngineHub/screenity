@@ -128,6 +128,7 @@ const CameraWrap = (props) => {
     !contentState.recording &&
     !contentState.pendingRecording &&
     !contentState.preparingRecording &&
+    !contentState.restartingRecording &&
     !contentState.startGateOpen &&
     !contentState.countdownActive &&
     !contentState.isCountdownVisible;
@@ -135,6 +136,7 @@ const CameraWrap = (props) => {
   // auth round-trip. pipActive false until "pip-started" keeps the bubble.
   const hidden =
     contentState.cameraInWindow ||
+    contentState.cameraPipElsewhere ||
     (!idle &&
       !contentState.cameraOnPage &&
       (contentState.pipActive ||
